@@ -7,7 +7,7 @@
 import itertools
 import math
 import warnings
-from typing import Optional
+from typing import List, Optional
 
 import torch
 from botorch.acquisition.objective import ScalarizedPosteriorTransform
@@ -63,13 +63,18 @@ def _gen_datasets(yvar: Optional[float] = None, **tkwargs):
 
 
 def _gen_model_and_data(
-    task_feature: int = 0, input_transform=None, outcome_transform=None, **tkwargs
+    task_feature: int = 0,
+    output_tasks: Optional[List[int]] = None,
+    input_transform=None,
+    outcome_transform=None,
+    **tkwargs
 ):
     datasets, (train_X, train_Y) = _gen_datasets(**tkwargs)
     model = MultiTaskGP(
         train_X,
         train_Y,
         task_feature=task_feature,
+        output_tasks=output_tasks,
         input_transform=input_transform,
         outcome_transform=outcome_transform,
     )
@@ -83,13 +88,18 @@ def _gen_model_single_output(**tkwargs):
 
 
 def _gen_fixed_noise_model_and_data(
-    task_feature: int = 0, input_transform=None, outcome_transform=None, **tkwargs
+    task_feature: int = 0,
+    input_transform=None,
+    outcome_transform=None,
+    use_fixed_noise_model_class: bool = False,
+    **tkwargs
 ):
     datasets, (train_X, train_Y, train_Yvar) = _gen_datasets(yvar=0.05, **tkwargs)
-    model = FixedNoiseMultiTaskGP(
+    model_class = FixedNoiseMultiTaskGP if use_fixed_noise_model_class else MultiTaskGP
+    model = model_class(
         train_X,
         train_Y,
-        train_Yvar,
+        train_Yvar=train_Yvar,
         task_feature=task_feature,
         input_transform=input_transform,
         outcome_transform=outcome_transform,
@@ -259,6 +269,27 @@ class TestMultiTaskGP(BotorchTestCase):
             self.assertIsInstance(posterior_f, GPyTorchPosterior)
             self.assertIsInstance(posterior_f.distribution, MultitaskMultivariateNormal)
 
+            # test posterior with X including the task features
+            posterior_expected = model.posterior(test_x, output_indices=[0])
+            test_x = torch.cat([torch.zeros_like(test_x), test_x], dim=-1)
+            posterior_f = model.posterior(test_x)
+            self.assertIsInstance(posterior_f, GPyTorchPosterior)
+            self.assertIsInstance(posterior_f.distribution, MultivariateNormal)
+            self.assertAllClose(posterior_f.mean, posterior_expected.mean)
+            self.assertAllClose(
+                posterior_f.covariance_matrix, posterior_expected.covariance_matrix
+            )
+
+            # test task features in X and output_indices is not None.
+            with self.assertRaisesRegex(ValueError, "`output_indices` must be None"):
+                model.posterior(test_x, output_indices=[0, 1])
+
+            # test invalid task feature in X.
+            invalid_x = test_x.clone()
+            invalid_x[0, 0, 0] = 3
+            with self.assertRaisesRegex(ValueError, "task features in `X`"):
+                model.posterior(invalid_x)
+
             # test that unsupported batch shape MTGPs throw correct error
             with self.assertRaises(ValueError):
                 MultiTaskGP(torch.rand(2, 2, 2), torch.rand(2, 2, 1), 0)
@@ -348,6 +379,11 @@ class TestMultiTaskGP(BotorchTestCase):
 
 
 class TestFixedNoiseMultiTaskGP(BotorchTestCase):
+    def test_deprecation_warning(self):
+        tkwargs = {"device": self.device, "dtype": torch.float}
+        with self.assertWarnsRegex(DeprecationWarning, "FixedNoise"):
+            _gen_fixed_noise_model_and_data(use_fixed_noise_model_class=True, **tkwargs)
+
     def test_FixedNoiseMultiTaskGP(self):
         bounds = torch.tensor([[-1.0, 0.0], [1.0, 1.0]])
         for dtype, use_intf, use_octf in itertools.product(
@@ -363,7 +399,7 @@ class TestFixedNoiseMultiTaskGP(BotorchTestCase):
             model, _, (train_X, _, _) = _gen_fixed_noise_model_and_data(
                 input_transform=intf, outcome_transform=octf, **tkwargs
             )
-            self.assertIsInstance(model, FixedNoiseMultiTaskGP)
+            self.assertIsInstance(model, MultiTaskGP)
             self.assertEqual(model.num_outputs, 2)
             self.assertIsInstance(model.likelihood, FixedNoiseGaussianLikelihood)
             self.assertIsInstance(model.mean_module, ConstantMean)
