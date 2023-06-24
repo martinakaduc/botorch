@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 import warnings
+from abc import abstractproperty
 from collections import OrderedDict
 from typing import Any, List, Optional, Tuple, Union
 from unittest import TestCase
@@ -93,10 +94,7 @@ class BotorchTestCase(TestCase):
         )
 
 
-class BaseTestProblemBaseTestCase:
-
-    functions: List[BaseTestProblem]
-
+class BaseTestProblemTestCaseMixIn:
     def test_forward(self):
         for dtype in (torch.float, torch.double):
             for batch_shape in (torch.Size(), torch.Size([2]), torch.Size([2, 3])):
@@ -113,8 +111,14 @@ class BaseTestProblemBaseTestCase:
                     )
                     self.assertEqual(res.shape, batch_shape + tail_shape)
 
+    @abstractproperty
+    def functions(self) -> List[BaseTestProblem]:
+        # The functions that should be tested. Typically defined as a class
+        # attribute on the test case subclassing this class.
+        pass  # pragma: no cover
 
-class SyntheticTestFunctionBaseTestCase(BaseTestProblemBaseTestCase):
+
+class SyntheticTestFunctionTestCaseMixin:
     def test_optimal_value(self):
         for dtype in (torch.float, torch.double):
             for f in self.functions:
@@ -141,6 +145,52 @@ class SyntheticTestFunctionBaseTestCase(BaseTestProblemBaseTestCase):
                 if f._check_grad_at_opt:
                     grad = torch.autograd.grad([*res], Xopt)[0]
                     self.assertLess(grad.abs().max().item(), 1e-3)
+
+
+class MultiObjectiveTestProblemTestCaseMixin:
+    def test_attributes(self):
+        for f in self.functions:
+            self.assertTrue(hasattr(f, "dim"))
+            self.assertTrue(hasattr(f, "num_objectives"))
+            self.assertEqual(f.bounds.shape, torch.Size([2, f.dim]))
+
+    def test_max_hv(self):
+        for dtype in (torch.float, torch.double):
+            for f in self.functions:
+                f.to(device=self.device, dtype=dtype)
+                if not hasattr(f, "_max_hv"):
+                    with self.assertRaises(NotImplementedError):
+                        f.max_hv
+                else:
+                    self.assertEqual(f.max_hv, f._max_hv)
+
+    def test_ref_point(self):
+        for dtype in (torch.float, torch.double):
+            for f in self.functions:
+                f.to(dtype=dtype, device=self.device)
+                self.assertTrue(
+                    torch.allclose(
+                        f.ref_point,
+                        torch.tensor(f._ref_point, dtype=dtype, device=self.device),
+                    )
+                )
+
+
+class ConstrainedTestProblemTestCaseMixin:
+    def test_num_constraints(self):
+        for f in self.functions:
+            self.assertTrue(hasattr(f, "num_constraints"))
+
+    def test_evaluate_slack_true(self):
+        for dtype in (torch.float, torch.double):
+            for f in self.functions:
+                f.to(device=self.device, dtype=dtype)
+                X = unnormalize(
+                    torch.rand(1, f.dim, device=self.device, dtype=dtype),
+                    bounds=f.bounds,
+                )
+                slack = f.evaluate_slack_true(X)
+                self.assertEqual(slack.shape, torch.Size([1, f.num_constraints]))
 
 
 class MockPosterior(Posterior):
@@ -370,49 +420,55 @@ def _get_test_posterior(
     return GPyTorchPosterior(mtmvn)
 
 
-class MultiObjectiveTestProblemBaseTestCase(BaseTestProblemBaseTestCase):
-    def test_attributes(self):
-        for f in self.functions:
-            self.assertTrue(hasattr(f, "dim"))
-            self.assertTrue(hasattr(f, "num_objectives"))
-            self.assertEqual(f.bounds.shape, torch.Size([2, f.dim]))
+def _get_max_violation_of_bounds(samples: torch.Tensor, bounds: torch.Tensor) -> float:
+    """
+    The maximum value by which samples lie outside bounds.
 
-    def test_max_hv(self):
-        for dtype in (torch.float, torch.double):
-            for f in self.functions:
-                f.to(device=self.device, dtype=dtype)
-                if not hasattr(f, "_max_hv"):
-                    with self.assertRaises(NotImplementedError):
-                        f.max_hv
-                else:
-                    self.assertEqual(f.max_hv, f._max_hv)
+    A negative value indicates that all samples lie within bounds.
 
-    def test_ref_point(self):
-        for dtype in (torch.float, torch.double):
-            for f in self.functions:
-                f.to(dtype=dtype, device=self.device)
-                self.assertTrue(
-                    torch.allclose(
-                        f.ref_point,
-                        torch.tensor(f._ref_point, dtype=dtype, device=self.device),
-                    )
-                )
+    Args:
+        samples: An `n x q x d` - dimension tensor, as might be returned from
+            `sample_q_batches_from_polytope`.
+        bounds: A `2 x d` tensor of lower and upper bounds for each column.
+    """
+    n, q, d = samples.shape
+    samples = samples.reshape((n * q, d))
+    lower = samples.min(0).values
+    upper = samples.max(0).values
+    lower_dist = (bounds[0, :] - lower).max().item()
+    upper_dist = (upper - bounds[1, :]).max().item()
+    return max(lower_dist, upper_dist)
 
 
-class ConstrainedMultiObjectiveTestProblemBaseTestCase(
-    MultiObjectiveTestProblemBaseTestCase
-):
-    def test_num_constraints(self):
-        for f in self.functions:
-            self.assertTrue(hasattr(f, "num_constraints"))
+def _get_max_violation_of_constraints(
+    samples: torch.Tensor,
+    constraints: Optional[List[Tuple[Tensor, Tensor, float]]],
+    equality: bool,
+) -> float:
+    r"""
+    Amount by which equality constraints are not obeyed.
 
-    def test_evaluate_slack_true(self):
-        for dtype in (torch.float, torch.double):
-            for f in self.functions:
-                f.to(device=self.device, dtype=dtype)
-                X = unnormalize(
-                    torch.rand(1, f.dim, device=self.device, dtype=dtype),
-                    bounds=f.bounds,
-                )
-                slack = f.evaluate_slack_true(X)
-                self.assertEqual(slack.shape, torch.Size([1, f.num_constraints]))
+    Args:
+        samples: An `n x q x d` - dimension tensor, as might be returned from
+            `sample_q_batches_from_polytope`.
+        constraints: A list of tuples (indices, coefficients, rhs),
+            with each tuple encoding an inequality constraint of the form
+            `\sum_i (X[indices[i]] * coefficients[i]) = rhs`, or `>=` if
+            `equality` is False.
+        equality: Whether these are equality constraints (not inequality).
+    """
+    n, q, d = samples.shape
+    max_error = 0
+    if constraints is not None:
+        for (ind, coef, rhs) in constraints:
+            if ind.ndim == 1:
+                constr = samples[:, :, ind] @ coef
+            else:
+                constr = samples[:, ind[:, 0], ind[:, 1]] @ coef
+
+            if equality:
+                error = (constr - rhs).abs().max()
+            else:
+                error = (rhs - constr).max()
+            max_error = max(max_error, error)
+    return max_error

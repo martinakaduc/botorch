@@ -19,7 +19,6 @@ from botorch.acquisition.analytic import (
 )
 from botorch.acquisition.fixed_feature import FixedFeatureAcquisitionFunction
 from botorch.acquisition.input_constructors import (
-    _deprecate_objective_arg,
     _field_is_shared,
     acqf_input_constructor,
     construct_inputs_mf_base,
@@ -27,6 +26,7 @@ from botorch.acquisition.input_constructors import (
     get_best_f_analytic,
     get_best_f_mc,
 )
+from botorch.acquisition.joint_entropy_search import qJointEntropySearch
 from botorch.acquisition.knowledge_gradient import (
     qKnowledgeGradient,
     qMultiFidelityKnowledgeGradient,
@@ -57,9 +57,7 @@ from botorch.acquisition.multi_objective.objective import (
 )
 from botorch.acquisition.multi_objective.utils import get_default_partitioning_alpha
 from botorch.acquisition.objective import (
-    AcquisitionObjective,
     LinearMCObjective,
-    ScalarizedObjective,
     ScalarizedPosteriorTransform,
 )
 from botorch.acquisition.preference import AnalyticExpectedUtilityOfBestOption
@@ -81,10 +79,6 @@ from botorch.utils.testing import BotorchTestCase, MockModel, MockPosterior
 
 
 class DummyAcquisitionFunction(AcquisitionFunction):
-    ...
-
-
-class DummyObjective(AcquisitionObjective):
     ...
 
 
@@ -120,10 +114,7 @@ class TestInputConstructorUtils(InputConstructorBaseTestCase, BotorchTestCase):
         with self.assertRaises(NotImplementedError):
             get_best_f_analytic(training_data=self.blockX_multiY)
         weights = torch.rand(2)
-        obj = ScalarizedObjective(weights=weights)
-        best_f_obj = get_best_f_analytic(
-            training_data=self.blockX_multiY, objective=obj
-        )
+
         post_tf = ScalarizedPosteriorTransform(weights=weights)
         best_f_tf = get_best_f_analytic(
             training_data=self.blockX_multiY, posterior_transform=post_tf
@@ -131,7 +122,6 @@ class TestInputConstructorUtils(InputConstructorBaseTestCase, BotorchTestCase):
 
         multi_Y = torch.cat([d.Y() for d in self.blockX_multiY.values()], dim=-1)
         best_f_expected = post_tf.evaluate(multi_Y).max()
-        self.assertEqual(best_f_obj, best_f_expected)
         self.assertEqual(best_f_tf, best_f_expected)
 
     def test_get_best_f_mc(self):
@@ -157,21 +147,6 @@ class TestInputConstructorUtils(InputConstructorBaseTestCase, BotorchTestCase):
         )
         best_f_expected = (multi_Y.sum(dim=-1)).max()
         self.assertEqual(best_f, best_f_expected)
-
-    def test_deprecate_objective_arg(self):
-        objective = ScalarizedObjective(weights=torch.ones(1))
-        post_tf = ScalarizedPosteriorTransform(weights=torch.zeros(1))
-        with self.assertRaises(RuntimeError):
-            _deprecate_objective_arg(posterior_transform=post_tf, objective=objective)
-        with self.assertWarns(DeprecationWarning):
-            new_tf = _deprecate_objective_arg(objective=objective)
-        self.assertTrue(torch.equal(new_tf.weights, objective.weights))
-        self.assertIsInstance(new_tf, ScalarizedPosteriorTransform)
-        new_tf = _deprecate_objective_arg(posterior_transform=post_tf)
-        self.assertEqual(id(new_tf), id(post_tf))
-        self.assertIsNone(_deprecate_objective_arg())
-        with self.assertRaises(UnsupportedError):
-            _deprecate_objective_arg(objective=DummyObjective())
 
     @mock.patch("botorch.acquisition.input_constructors.optimize_acqf")
     def test_optimize_objective(self, mock_optimize_acqf):
@@ -315,11 +290,14 @@ class TestAnalyticAcquisitionFunctionInputConstructors(
         mock_model.num_outputs = 3
         mock_model.train_inputs = [None]
         mock_pref_model = mock.Mock()
+
+        # test basic construction
         kwargs = c(model=mock_model, pref_model=mock_pref_model)
         self.assertTrue(isinstance(kwargs["outcome_model"], FixedSingleSampleModel))
         self.assertTrue(kwargs["pref_model"] is mock_pref_model)
         self.assertTrue(kwargs["previous_winner"] is None)
 
+        # test previous_winner
         previous_winner = torch.randn(3)
         kwargs = c(
             model=mock_model,
@@ -327,6 +305,16 @@ class TestAnalyticAcquisitionFunctionInputConstructors(
             previous_winner=previous_winner,
         )
         self.assertTrue(torch.equal(kwargs["previous_winner"], previous_winner))
+
+        # test sample_multiplier
+        torch.manual_seed(123)
+        kwargs = c(
+            model=mock_model,
+            pref_model=mock_pref_model,
+            sample_multiplier=1e6,
+        )
+        # w by default is drawn from std normal and very unlikely to be > 10.0
+        self.assertTrue((kwargs["outcome_model"].w.abs() > 10.0).all())
 
 
 class TestMCAcquisitionFunctionInputConstructors(
@@ -396,7 +384,7 @@ class TestMCAcquisitionFunctionInputConstructors(
         self.assertIsNone(kwargs["objective"])
         self.assertIsNone(kwargs["X_pending"])
         self.assertIsNone(kwargs["sampler"])
-        self.assertFalse(kwargs["prune_baseline"])
+        self.assertTrue(kwargs["prune_baseline"])
         self.assertTrue(torch.equal(kwargs["X_baseline"], self.blockX_blockY[0].X()))
         with self.assertRaisesRegex(ValueError, "Field `X` must be shared"):
             c(model=mock_model, training_data=self.multiX_multiY)
@@ -405,13 +393,13 @@ class TestMCAcquisitionFunctionInputConstructors(
             model=mock_model,
             training_data=self.blockX_blockY,
             X_baseline=X_baseline,
-            prune_baseline=True,
+            prune_baseline=False,
         )
         self.assertEqual(kwargs["model"], mock_model)
         self.assertIsNone(kwargs["objective"])
         self.assertIsNone(kwargs["X_pending"])
         self.assertIsNone(kwargs["sampler"])
-        self.assertTrue(kwargs["prune_baseline"])
+        self.assertFalse(kwargs["prune_baseline"])
         self.assertTrue(torch.equal(kwargs["X_baseline"], X_baseline))
 
     def test_construct_inputs_qPI(self):
@@ -976,3 +964,29 @@ class TestMultiObjectiveAcquisitionFunctionInputConstructors(
             inputs_mfmes = input_constructor(**constructor_args)
             inputs_test = {"foo": 0, "bar": 1, "current_value": current_value}
             self.assertEqual(inputs_mfmes, inputs_test)
+
+    def test_construct_inputs_jes(self):
+        func = get_acqf_input_constructor(qJointEntropySearch)
+        # we need to run optimize_posterior_samples, so we sort of need
+        # a real model as there is no other (apparent) option
+        model = SingleTaskGP(self.blockX_blockY[0].X(), self.blockX_blockY[0].Y())
+
+        kwargs = func(
+            model=model,
+            training_data=self.blockX_blockY,
+            objective=LinearMCObjective(torch.rand(2)),
+            bounds=self.bounds,
+            num_optima=17,
+            maximize=False,
+        )
+
+        self.assertFalse(kwargs["maximize"])
+        self.assertEqual(
+            self.blockX_blockY[0].X().dtype, kwargs["optimal_inputs"].dtype
+        )
+        self.assertEqual(len(kwargs["optimal_inputs"]), 17)
+        self.assertEqual(len(kwargs["optimal_outputs"]), 17)
+        # asserting that, for the non-batch case, the optimal inputs are
+        # of shape N x D and outputs are N x 1
+        self.assertEqual(len(kwargs["optimal_inputs"].shape), 2)
+        self.assertEqual(len(kwargs["optimal_outputs"].shape), 2)

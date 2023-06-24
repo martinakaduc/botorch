@@ -55,10 +55,12 @@ from botorch.acquisition.objective import (
     LearnedObjective,
     LinearMCObjective,
     MCAcquisitionObjective,
-    ScalarizedObjective,
     ScalarizedPosteriorTransform,
 )
-from botorch.acquisition.preference import AnalyticExpectedUtilityOfBestOption
+from botorch.acquisition.preference import (
+    AnalyticExpectedUtilityOfBestOption,
+    PairwiseBayesianActiveLearningByDisagreement,
+)
 from botorch.acquisition.proximal import ProximalAcquisitionFunction
 from botorch.acquisition.utils import get_acquisition_function
 
@@ -73,6 +75,7 @@ __all__ = [
     "InverseCostWeightedUtility",
     "NoisyExpectedImprovement",
     "OneShotAcquisitionFunction",
+    "PairwiseBayesianActiveLearningByDisagreement",
     "PairwiseMCPosteriorVariance",
     "PosteriorMean",
     "ProbabilityOfImprovement",
@@ -100,7 +103,6 @@ __all__ = [
     "LinearMCObjective",
     "MCAcquisitionFunction",
     "MCAcquisitionObjective",
-    "ScalarizedObjective",
     "ScalarizedPosteriorTransform",
     "get_acquisition_function",
     "get_acqf_input_constructor",

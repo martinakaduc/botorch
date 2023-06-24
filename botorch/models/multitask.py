@@ -9,6 +9,14 @@ Multi-Task GP models.
 
 References
 
+.. [Bonilla2007MTGP]
+    E. Bonilla, K. Chai and C. Williams. Multi-task Gaussian Process Prediction.
+    Advances in Neural Information Processing Systems 20, NeurIPS 2007.
+
+.. [Swersky2013MTBO]
+    K. Swersky, J. Snoek and R. Adams. Multi-Task Bayesian Optimization.
+    Advances in Neural Information Processing Systems 26, NeurIPS 2013.
+
 .. [Doucet2010sampl]
     A. Doucet. A Note on Efficient Conditional Simulation of Gaussian Distributions.
     http://www.stats.ox.ac.uk/~doucet/doucet_simulationconditionalgaussian.pdf,
@@ -22,15 +30,19 @@ References
 from __future__ import annotations
 
 import math
+import warnings
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from botorch.acquisition.objective import PosteriorTransform
-from botorch.models.gp_regression import MIN_INFERRED_NOISE_LEVEL
 from botorch.models.gpytorch import GPyTorchModel, MultiTaskGPyTorchModel
 from botorch.models.model import FantasizeMixin
 from botorch.models.transforms.input import InputTransform
 from botorch.models.transforms.outcome import OutcomeTransform
+from botorch.models.utils.gpytorch_modules import (
+    get_matern_kernel_with_gamma_prior,
+    MIN_INFERRED_NOISE_LEVEL,
+)
 from botorch.posteriors.multitask import MultitaskGPPosterior
 from botorch.utils.datasets import SupervisedDataset
 from gpytorch.constraints import GreaterThan
@@ -41,7 +53,6 @@ from gpytorch.distributions.multivariate_normal import MultivariateNormal
 from gpytorch.kernels.index_kernel import IndexKernel
 from gpytorch.kernels.matern_kernel import MaternKernel
 from gpytorch.kernels.multitask_kernel import MultitaskKernel
-from gpytorch.kernels.scale_kernel import ScaleKernel
 from gpytorch.likelihoods.gaussian_likelihood import (
     FixedNoiseGaussianLikelihood,
     GaussianLikelihood,
@@ -73,16 +84,20 @@ from torch import Tensor
 
 
 class MultiTaskGP(ExactGP, MultiTaskGPyTorchModel, FantasizeMixin):
-    r"""Multi-Task GP model using an ICM kernel, inferring observation noise.
+    r"""Multi-Task exact GP model using an ICM (intrinsic co-regionalization model)
+    kernel. See [Bonilla2007MTGP]_ and [Swersky2013MTBO]_ for a reference on the
+    model and its use in Bayesian optimization.
 
-    Multi-task exact GP that uses a simple ICM kernel. Can be single-output or
-    multi-output. This model uses relatively strong priors on the base Kernel
-    hyperparameters, which work best when covariates are normalized to the unit
-    cube and outcomes are standardized (zero mean, unit variance).
 
-    This model infers the noise level. WARNING: It currently does not support
-    different noise levels for the different tasks. If you have known observation
-    noise, please use `FixedNoiseMultiTaskGP` instead.
+    The model can be single-output or multi-output, determined by the `output_tasks`.
+    This model uses relatively strong priors on the base Kernel hyperparameters, which
+    work best when covariates are normalized to the unit cube and outcomes are
+    standardized (zero mean, unit variance).
+
+    If the `train_Yvar` is None, this model infers the noise level. If you have
+    known observation noise, you can set `train_Yvar` to a tensor containing
+    the noise variance measurements. WARNING: This currently does not support
+    different noise levels for the different tasks.
     """
 
     def __init__(
@@ -90,6 +105,7 @@ class MultiTaskGP(ExactGP, MultiTaskGPyTorchModel, FantasizeMixin):
         train_X: Tensor,
         train_Y: Tensor,
         task_feature: int,
+        train_Yvar: Optional[Tensor] = None,
         covar_module: Optional[Module] = None,
         task_covar_prior: Optional[Prior] = None,
         output_tasks: Optional[List[int]] = None,
@@ -97,7 +113,7 @@ class MultiTaskGP(ExactGP, MultiTaskGPyTorchModel, FantasizeMixin):
         input_transform: Optional[InputTransform] = None,
         outcome_transform: Optional[OutcomeTransform] = None,
     ) -> None:
-        r"""Multi-Task GP model using an ICM kernel, inferring observation noise.
+        r"""Multi-Task GP model using an ICM kernel.
 
         Args:
             train_X: A `n x (d + 1)` or `b x n x (d + 1)` (batch mode) tensor
@@ -105,6 +121,9 @@ class MultiTaskGP(ExactGP, MultiTaskGPyTorchModel, FantasizeMixin):
                 features (see `task_feature` argument).
             train_Y: A `n x 1` or `b x n x 1` (batch mode) tensor of training
                 observations.
+            train_Yvar: An optional `n` or `b x n` (batch mode) tensor of observed
+                measurement noise. If None, we infer the noise.
+                Note that the inferred noise is common across all tasks.
             task_feature: The index of the task feature (`-d <= task_feature <= d`).
             output_tasks: A list of task indices for which to compute model
                 outputs for. If omitted, return outputs for all task indices.
@@ -132,12 +151,13 @@ class MultiTaskGP(ExactGP, MultiTaskGPyTorchModel, FantasizeMixin):
             transformed_X = self.transform_inputs(
                 X=train_X, input_transform=input_transform
             )
-        self._validate_tensor_args(X=transformed_X, Y=train_Y)
-        all_tasks, task_feature, d = self.get_all_tasks(
+        self._validate_tensor_args(X=transformed_X, Y=train_Y, Yvar=train_Yvar)
+        all_tasks, task_feature, self.num_non_task_features = self.get_all_tasks(
             transformed_X, task_feature, output_tasks
         )
+        self.num_tasks = len(all_tasks)
         if outcome_transform is not None:
-            train_Y, _ = outcome_transform(train_Y)
+            train_Y, train_Yvar = outcome_transform(Y=train_Y, Yvar=train_Yvar)
 
         # squeeze output dim
         train_Y = train_Y.squeeze(-1)
@@ -150,11 +170,14 @@ class MultiTaskGP(ExactGP, MultiTaskGPyTorchModel, FantasizeMixin):
         self._num_outputs = len(output_tasks)
 
         # TODO (T41270962): Support task-specific noise levels in likelihood
-        likelihood = GaussianLikelihood(noise_prior=GammaPrior(1.1, 0.05))
+        if train_Yvar is None:
+            likelihood = GaussianLikelihood(noise_prior=GammaPrior(1.1, 0.05))
+        else:
+            likelihood = FixedNoiseGaussianLikelihood(noise=train_Yvar.squeeze(-1))
 
         # construct indexer to be used in forward
         self._task_feature = task_feature
-        self._base_idxr = torch.arange(d)
+        self._base_idxr = torch.arange(self.num_non_task_features)
         self._base_idxr[task_feature:] += 1  # exclude task feature
 
         super().__init__(
@@ -162,20 +185,15 @@ class MultiTaskGP(ExactGP, MultiTaskGPyTorchModel, FantasizeMixin):
         )
         self.mean_module = ConstantMean()
         if covar_module is None:
-            self.covar_module = ScaleKernel(
-                base_kernel=MaternKernel(
-                    nu=2.5, ard_num_dims=d, lengthscale_prior=GammaPrior(3.0, 6.0)
-                ),
-                outputscale_prior=GammaPrior(2.0, 0.15),
+            self.covar_module = get_matern_kernel_with_gamma_prior(
+                ard_num_dims=self.num_non_task_features
             )
         else:
             self.covar_module = covar_module
 
-        num_tasks = len(all_tasks)
-        self._rank = rank if rank is not None else num_tasks
-
+        self._rank = rank if rank is not None else self.num_tasks
         self.task_covar_module = IndexKernel(
-            num_tasks=num_tasks, rank=self._rank, prior=task_covar_prior
+            num_tasks=self.num_tasks, rank=self._rank, prior=task_covar_prior
         )
         if input_transform is not None:
             self.input_transform = input_transform
@@ -298,14 +316,7 @@ class MultiTaskGP(ExactGP, MultiTaskGPyTorchModel, FantasizeMixin):
 class FixedNoiseMultiTaskGP(MultiTaskGP):
     r"""Multi-Task GP model using an ICM kernel, with known observation noise.
 
-    This is the fixed-noise version of `MultiTaskGP` -– that is,
-    `FixedNoiseMultiTaskGP` is to `MultiTaskGP` as `FixedNoiseGP` is to
-    `SingleTaskGP`. It can be single-output or
-    multi-output. This model uses relatively strong priors on the base Kernel
-    hyperparameters, which work best when covariates are normalized to the unit
-    cube and outcomes are standardized (zero mean, unit variance).
-
-    This model requires observation noise data (specified in `train_Yvar`).
+    DEPRECATED: Please use `MultiTaskGP` with `train_Yvar` instead.
     """
 
     def __init__(
@@ -328,8 +339,8 @@ class FixedNoiseMultiTaskGP(MultiTaskGP):
                 features (see `task_feature` argument).
             train_Y: A `n x 1` or `b x n x 1` (batch mode) tensor of training
                 observations.
-            train_Yvar: A `n` or `b x n` (batch mode) tensor of observation
-                noise standard errors.
+            train_Yvar: A `n` or `b x n` (batch mode) tensor of observed measurement
+                noise.
             task_feature: The index of the task feature (`-d <= task_feature <= d`).
             task_covar_prior : A Prior on the task covariance matrix. Must operate
                 on p.s.d. matrices. A common prior for this is the `LKJ` prior.
@@ -354,32 +365,25 @@ class FixedNoiseMultiTaskGP(MultiTaskGP):
             >>> train_Yvar = 0.1 + 0.1 * torch.rand_like(train_Y)
             >>> model = FixedNoiseMultiTaskGP(train_X, train_Y, train_Yvar, -1)
         """
-        with torch.no_grad():
-            transformed_X = self.transform_inputs(
-                X=train_X, input_transform=input_transform
-            )
-        self._validate_tensor_args(X=transformed_X, Y=train_Y, Yvar=train_Yvar)
-
-        if outcome_transform is not None:
-            train_Y, train_Yvar = outcome_transform(train_Y, train_Yvar)
-
-        # We'll instatiate a MultiTaskGP and simply override the likelihood
+        warnings.warn(
+            "`FixedNoiseMultiTaskGP` has been deprecated and will be removed in a "
+            "future release. Please use the `MultiTaskGP` model instead. "
+            "When `train_Yvar` is specified, `MultiTaskGP` behaves the same "
+            "as the `FixedNoiseMultiTaskGP`.",
+            DeprecationWarning,
+        )
         super().__init__(
             train_X=train_X,
             train_Y=train_Y,
+            train_Yvar=train_Yvar,
             covar_module=covar_module,
             task_feature=task_feature,
             output_tasks=output_tasks,
             rank=rank,
             task_covar_prior=task_covar_prior,
             input_transform=input_transform,
-            outcome_transform=None,  # outcome_transform is applied already
+            outcome_transform=outcome_transform,
         )
-
-        if outcome_transform is not None:
-            self.outcome_transform = outcome_transform
-        self.likelihood = FixedNoiseGaussianLikelihood(noise=train_Yvar.squeeze(-1))
-        self.to(train_X)
 
 
 class KroneckerMultiTaskGP(ExactGP, GPyTorchModel, FantasizeMixin):
