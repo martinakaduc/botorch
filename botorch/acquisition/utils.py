@@ -65,13 +65,13 @@ def get_acquisition_function(
         constraints: A list of callables, each mapping a Tensor of dimension
             `sample_shape x batch-shape x q x m` to a Tensor of dimension
             `sample_shape x batch-shape x q`, where negative values imply
-            feasibility. Used only for qEHVI and qNEHVI.
+            feasibility. Used for all acquisition functions except qSR and qUCB.
         eta: The temperature parameter for the sigmoid function used for the
             differentiable approximation of the constraints. In case of a float the
             same eta is used for every constraint in constraints. In case of a
             tensor the length of the tensor must match the number of provided
             constraints. The i-th constraint is then estimated with the i-th
-            eta value. Used only for qEHVI and qNEHVI.
+            eta value. Used for all acquisition functions except qSR and qUCB.
         mc_samples: The number of samples to use for (q)MC evaluation of the
             acquisition function.
         seed: If provided, perform deterministic optimization (i.e. the
@@ -100,7 +100,7 @@ def get_acquisition_function(
             "acquisition functions."
         )
     # instantiate and return the requested acquisition function
-    if acquisition_function_name in ("qEI", "qPI"):
+    if acquisition_function_name in ("qEI", "qLogEI", "qPI"):
         # Since these are the non-noisy variants, use the posterior mean at the observed
         # inputs directly to compute the best feasible value without sampling.
         Y = model.posterior(X_observed, posterior_transform=posterior_transform).mean
@@ -125,6 +125,22 @@ def get_acquisition_function(
             constraints=constraints,
             eta=eta,
         )
+    if acquisition_function_name == "qLogEI":
+        # putting the import here to avoid circular imports
+        # ideally, the entire function should be moved out of this file,
+        # but since it is used for legacy code to be deprecated, we keep it here.
+        from botorch.acquisition.logei import qLogExpectedImprovement
+
+        return qLogExpectedImprovement(
+            model=model,
+            best_f=best_f,
+            sampler=sampler,
+            objective=objective,
+            posterior_transform=posterior_transform,
+            X_pending=X_pending,
+            constraints=constraints,
+            eta=eta,
+        )
     elif acquisition_function_name == "qPI":
         return monte_carlo.qProbabilityOfImprovement(
             model=model,
@@ -139,6 +155,22 @@ def get_acquisition_function(
         )
     elif acquisition_function_name == "qNEI":
         return monte_carlo.qNoisyExpectedImprovement(
+            model=model,
+            X_baseline=X_observed,
+            sampler=sampler,
+            objective=objective,
+            posterior_transform=posterior_transform,
+            X_pending=X_pending,
+            prune_baseline=kwargs.get("prune_baseline", True),
+            marginalize_dim=kwargs.get("marginalize_dim"),
+            cache_root=kwargs.get("cache_root", True),
+            constraints=constraints,
+            eta=eta,
+        )
+    elif acquisition_function_name == "qLogNEI":
+        from botorch.acquisition.logei import qLogNoisyExpectedImprovement
+
+        return qLogNoisyExpectedImprovement(
             model=model,
             X_baseline=X_observed,
             sampler=sampler,

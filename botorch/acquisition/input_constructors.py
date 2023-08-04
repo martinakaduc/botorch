@@ -47,6 +47,12 @@ from botorch.acquisition.knowledge_gradient import (
     qKnowledgeGradient,
     qMultiFidelityKnowledgeGradient,
 )
+from botorch.acquisition.logei import (
+    qLogExpectedImprovement,
+    qLogNoisyExpectedImprovement,
+    TAU_MAX,
+    TAU_RELU,
+)
 from botorch.acquisition.max_value_entropy_search import (
     qMaxValueEntropy,
     qMultiFidelityMaxValueEntropy,
@@ -507,6 +513,72 @@ def construct_inputs_qEI(
     return {**base_inputs, "best_f": best_f, "constraints": constraints, "eta": eta}
 
 
+@acqf_input_constructor(qLogExpectedImprovement)
+def construct_inputs_qLogEI(
+    model: Model,
+    training_data: MaybeDict[SupervisedDataset],
+    objective: Optional[MCAcquisitionObjective] = None,
+    posterior_transform: Optional[PosteriorTransform] = None,
+    X_pending: Optional[Tensor] = None,
+    sampler: Optional[MCSampler] = None,
+    best_f: Optional[Union[float, Tensor]] = None,
+    constraints: Optional[List[Callable[[Tensor], Tensor]]] = None,
+    eta: Union[Tensor, float] = 1e-3,
+    fat: bool = True,
+    tau_max: float = TAU_MAX,
+    tau_relu: float = TAU_RELU,
+    **ignored: Any,
+) -> Dict[str, Any]:
+    r"""Construct kwargs for the `qExpectedImprovement` constructor.
+
+    Args:
+        model: The model to be used in the acquisition function.
+        training_data: Dataset(s) used to train the model.
+        objective: The objective to be used in the acquisition function.
+        posterior_transform: The posterior transform to be used in the
+            acquisition function.
+        X_pending: A `m x d`-dim Tensor of `m` design points that have been
+            submitted for function evaluation but have not yet been evaluated.
+            Concatenated into X upon forward call.
+        sampler: The sampler used to draw base samples. If omitted, uses
+            the acquisition functions's default sampler.
+        best_f: Threshold above (or below) which improvement is defined.
+        constraints: A list of constraint callables which map a Tensor of posterior
+            samples of dimension `sample_shape x batch-shape x q x m`-dim to a
+            `sample_shape x batch-shape x q`-dim Tensor. The associated constraints
+            are considered satisfied if the output is less than zero.
+        eta: Temperature parameter(s) governing the smoothness of the sigmoid
+            approximation to the constraint indicators. For more details, on this
+            parameter, see the docs of `compute_smoothed_feasibility_indicator`.
+        fat: Toggles the logarithmic / linear asymptotic behavior of the smooth
+            approximation to the ReLU.
+        tau_max: Temperature parameter controlling the sharpness of the smooth
+            approximations to max.
+        tau_relu: Temperature parameter controlling the sharpness of the smooth
+            approximations to ReLU.
+        ignored: Not used.
+
+    Returns:
+        A dict mapping kwarg names of the constructor to values.
+    """
+    return {
+        **construct_inputs_qEI(
+            model=model,
+            training_data=training_data,
+            objective=objective,
+            posterior_transform=posterior_transform,
+            X_pending=X_pending,
+            sampler=sampler,
+            best_f=best_f,
+            constraints=constraints,
+            eta=eta,
+        ),
+        "fat": fat,
+        "tau_max": tau_max,
+        "tau_relu": tau_relu,
+    }
+
+
 @acqf_input_constructor(qNoisyExpectedImprovement)
 def construct_inputs_qNEI(
     model: Model,
@@ -569,7 +641,6 @@ def construct_inputs_qNEI(
             assert_shared=True,
             first_only=True,
         )
-
     return {
         **base_inputs,
         "X_baseline": X_baseline,
@@ -577,6 +648,82 @@ def construct_inputs_qNEI(
         "cache_root": cache_root,
         "constraints": constraints,
         "eta": eta,
+    }
+
+
+@acqf_input_constructor(qLogNoisyExpectedImprovement)
+def construct_inputs_qLogNEI(
+    model: Model,
+    training_data: MaybeDict[SupervisedDataset],
+    objective: Optional[MCAcquisitionObjective] = None,
+    posterior_transform: Optional[PosteriorTransform] = None,
+    X_pending: Optional[Tensor] = None,
+    sampler: Optional[MCSampler] = None,
+    X_baseline: Optional[Tensor] = None,
+    prune_baseline: Optional[bool] = True,
+    cache_root: Optional[bool] = True,
+    constraints: Optional[List[Callable[[Tensor], Tensor]]] = None,
+    eta: Union[Tensor, float] = 1e-3,
+    fat: bool = True,
+    tau_max: float = TAU_MAX,
+    tau_relu: float = TAU_RELU,
+    **ignored: Any,
+):
+    r"""Construct kwargs for the `qNoisyExpectedImprovement` constructor.
+
+    Args:
+        model: The model to be used in the acquisition function.
+        training_data: Dataset(s) used to train the model.
+        objective: The objective to be used in the acquisition function.
+        posterior_transform: The posterior transform to be used in the
+            acquisition function.
+        X_pending: A `m x d`-dim Tensor of `m` design points that have been
+            submitted for function evaluation but have not yet been evaluated.
+            Concatenated into X upon forward call.
+        sampler: The sampler used to draw base samples. If omitted, uses
+            the acquisition functions's default sampler.
+        X_baseline: A `batch_shape x r x d`-dim Tensor of `r` design points
+            that have already been observed. These points are considered as
+            the potential best design point. If omitted, checks that all
+            training_data have the same input features and take the first `X`.
+        prune_baseline: If True, remove points in `X_baseline` that are
+            highly unlikely to be the best point. This can significantly
+            improve performance and is generally recommended.
+        constraints: A list of constraint callables which map a Tensor of posterior
+            samples of dimension `sample_shape x batch-shape x q x m`-dim to a
+            `sample_shape x batch-shape x q`-dim Tensor. The associated constraints
+            are considered satisfied if the output is less than zero.
+        eta: Temperature parameter(s) governing the smoothness of the sigmoid
+            approximation to the constraint indicators. For more details, on this
+            parameter, see the docs of `compute_smoothed_feasibility_indicator`.
+        fat: Toggles the logarithmic / linear asymptotic behavior of the smooth
+            approximation to the ReLU.
+        tau_max: Temperature parameter controlling the sharpness of the smooth
+            approximations to max.
+        tau_relu: Temperature parameter controlling the sharpness of the smooth
+            approximations to ReLU.
+        ignored: Not used.
+
+    Returns:
+        A dict mapping kwarg names of the constructor to values.
+    """
+    return {
+        **construct_inputs_qNEI(
+            model=model,
+            training_data=training_data,
+            objective=objective,
+            posterior_transform=posterior_transform,
+            X_pending=X_pending,
+            sampler=sampler,
+            X_baseline=X_baseline,
+            prune_baseline=prune_baseline,
+            cache_root=cache_root,
+            constraint=constraints,
+            eta=eta,
+        ),
+        "fat": fat,
+        "tau_max": tau_max,
+        "tau_relu": tau_relu,
     }
 
 
@@ -839,7 +986,6 @@ def construct_inputs_qNEHVI(
             first_only=True,
             assert_shared=True,
         )
-
     # This selects the objectives (a subset of the outcomes) and set each
     # objective threhsold to have the proper optimization direction.
     if objective is None:
@@ -867,6 +1013,8 @@ def construct_inputs_qNEHVI(
     else:
         ref_point = objective(objective_thresholds)
 
+    num_objectives = objective_thresholds[~torch.isnan(objective_thresholds)].shape[0]
+
     return {
         "model": model,
         "ref_point": ref_point,
@@ -877,7 +1025,7 @@ def construct_inputs_qNEHVI(
         "X_pending": kwargs.get("X_pending"),
         "eta": kwargs.get("eta", 1e-3),
         "prune_baseline": kwargs.get("prune_baseline", True),
-        "alpha": kwargs.get("alpha", get_default_partitioning_alpha(model.num_outputs)),
+        "alpha": kwargs.get("alpha", get_default_partitioning_alpha(num_objectives)),
         "cache_pending": kwargs.get("cache_pending", True),
         "max_iep": kwargs.get("max_iep", 0),
         "incremental_nehvi": kwargs.get("incremental_nehvi", True),
@@ -1088,7 +1236,9 @@ def construct_inputs_analytic_eubo(
     # construct a deterministic fixed single sample model from `model`
     # i.e., performing EUBO-zeta by default as described
     # in https://arxiv.org/abs/2203.11382
-    w = torch.randn(model.num_outputs) * sample_multiplier
+    # using pref_model.dim instead of model.num_outputs here as MTGP's
+    # num_outputs could be tied to the number of tasks
+    w = torch.randn(pref_model.dim) * sample_multiplier
     one_sample_outcome_model = FixedSingleSampleModel(model=model, w=w)
 
     return {
