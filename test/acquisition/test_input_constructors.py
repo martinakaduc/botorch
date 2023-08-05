@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import math
+
 from typing import Callable
 from unittest import mock
 
@@ -30,6 +32,12 @@ from botorch.acquisition.joint_entropy_search import qJointEntropySearch
 from botorch.acquisition.knowledge_gradient import (
     qKnowledgeGradient,
     qMultiFidelityKnowledgeGradient,
+)
+from botorch.acquisition.logei import (
+    qLogExpectedImprovement,
+    qLogNoisyExpectedImprovement,
+    TAU_MAX,
+    TAU_RELU,
 )
 from botorch.acquisition.max_value_entropy_search import (
     qMaxValueEntropy,
@@ -66,8 +74,9 @@ from botorch.acquisition.utils import (
     project_to_target_fidelity,
 )
 from botorch.exceptions.errors import UnsupportedError
-from botorch.models import SingleTaskGP
+from botorch.models import MultiTaskGP, SingleTaskGP
 from botorch.models.deterministic import FixedSingleSampleModel
+from botorch.models.model_list_gp_regression import ModelListGP
 from botorch.sampling.normal import IIDNormalSampler, SobolQMCNormalSampler
 from botorch.utils.constraints import get_outcome_constraint_transforms
 from botorch.utils.datasets import SupervisedDataset
@@ -131,22 +140,22 @@ class TestInputConstructorUtils(InputConstructorBaseTestCase, BotorchTestCase):
         best_f = get_best_f_mc(training_data=self.blockX_blockY)
         self.assertEqual(best_f, get_best_f_mc(self.blockX_blockY[0]))
 
-        best_f_expected = self.blockX_blockY[0].Y().squeeze().max()
-        self.assertEqual(best_f, best_f_expected)
+        best_f_expected = self.blockX_blockY[0].Y().max(dim=0).values
+        self.assertAllClose(best_f, best_f_expected)
         with self.assertRaisesRegex(UnsupportedError, "require an objective"):
             get_best_f_mc(training_data=self.blockX_multiY)
         obj = LinearMCObjective(weights=torch.rand(2))
         best_f = get_best_f_mc(training_data=self.blockX_multiY, objective=obj)
 
         multi_Y = torch.cat([d.Y() for d in self.blockX_multiY.values()], dim=-1)
-        best_f_expected = (multi_Y @ obj.weights).max()
-        self.assertEqual(best_f, best_f_expected)
+        best_f_expected = (multi_Y @ obj.weights).amax(dim=-1, keepdim=True)
+        self.assertAllClose(best_f, best_f_expected)
         post_tf = ScalarizedPosteriorTransform(weights=torch.ones(2))
         best_f = get_best_f_mc(
             training_data=self.blockX_multiY, posterior_transform=post_tf
         )
-        best_f_expected = (multi_Y.sum(dim=-1)).max()
-        self.assertEqual(best_f, best_f_expected)
+        best_f_expected = (multi_Y.sum(dim=-1)).amax(dim=-1, keepdim=True)
+        self.assertAllClose(best_f, best_f_expected)
 
     @mock.patch("botorch.acquisition.input_constructors.optimize_acqf")
     def test_optimize_objective(self, mock_optimize_acqf):
@@ -285,22 +294,36 @@ class TestAnalyticAcquisitionFunctionInputConstructors(
             c(model=mock_model, training_data=self.multiX_multiY)
 
     def test_construct_inputs_constrained_analytic_eubo(self):
+        # create dummy modellist gp
+        n = 10
+        X = torch.linspace(0, 0.95, n).unsqueeze(dim=-1)
+        Y1, Y2 = torch.sin(X * (2 * math.pi)), torch.cos(X * (2 * math.pi))
+        # 3 tasks
+        train_X = torch.cat(
+            [torch.nn.functional.pad(X, (1, 0), value=i) for i in range(3)]
+        )
+        train_Y = torch.cat([Y1, Y2])  # train_Y is a 1d tensor with shape (2n,)
+        # model list of 2, so model.num_outputs is 4
+        model = ModelListGP(
+            *[MultiTaskGP(train_X, train_Y, task_feature=0) for i in range(2)]
+        )
+        self.assertEqual(model.num_outputs, 6)
+
         c = get_acqf_input_constructor(AnalyticExpectedUtilityOfBestOption)
-        mock_model = mock.Mock()
-        mock_model.num_outputs = 3
-        mock_model.train_inputs = [None]
         mock_pref_model = mock.Mock()
+        # assume we only have a preference model with 2 outcomes
+        mock_pref_model.dim = 2
 
         # test basic construction
-        kwargs = c(model=mock_model, pref_model=mock_pref_model)
-        self.assertTrue(isinstance(kwargs["outcome_model"], FixedSingleSampleModel))
-        self.assertTrue(kwargs["pref_model"] is mock_pref_model)
-        self.assertTrue(kwargs["previous_winner"] is None)
+        kwargs = c(model=model, pref_model=mock_pref_model)
+        self.assertIsInstance(kwargs["outcome_model"], FixedSingleSampleModel)
+        self.assertIs(kwargs["pref_model"], mock_pref_model)
+        self.assertIsNone(kwargs["previous_winner"])
 
         # test previous_winner
-        previous_winner = torch.randn(3)
+        previous_winner = torch.randn(mock_pref_model.dim)
         kwargs = c(
-            model=mock_model,
+            model=model,
             pref_model=mock_pref_model,
             previous_winner=previous_winner,
         )
@@ -309,12 +332,14 @@ class TestAnalyticAcquisitionFunctionInputConstructors(
         # test sample_multiplier
         torch.manual_seed(123)
         kwargs = c(
-            model=mock_model,
+            model=model,
             pref_model=mock_pref_model,
             sample_multiplier=1e6,
         )
         # w by default is drawn from std normal and very unlikely to be > 10.0
         self.assertTrue((kwargs["outcome_model"].w.abs() > 10.0).all())
+        # Check w has the right dimension that agrees with the preference model
+        self.assertEqual(kwargs["outcome_model"].w.shape[-1], mock_pref_model.dim)
 
 
 class TestMCAcquisitionFunctionInputConstructors(
@@ -350,6 +375,9 @@ class TestMCAcquisitionFunctionInputConstructors(
         self.assertIsNone(kwargs["objective"])
         self.assertIsNone(kwargs["X_pending"])
         self.assertIsNone(kwargs["sampler"])
+        self.assertIsNone(kwargs["constraints"])
+        self.assertIsInstance(kwargs["eta"], float)
+        self.assertTrue(kwargs["eta"] < 1)
         X_pending = torch.rand(2, 2)
         objective = LinearMCObjective(torch.rand(2))
         kwargs = c(
@@ -362,6 +390,9 @@ class TestMCAcquisitionFunctionInputConstructors(
         self.assertTrue(torch.equal(kwargs["objective"].weights, objective.weights))
         self.assertTrue(torch.equal(kwargs["X_pending"], X_pending))
         self.assertIsNone(kwargs["sampler"])
+        self.assertIsNone(kwargs["constraints"])
+        self.assertIsInstance(kwargs["eta"], float)
+        self.assertTrue(kwargs["eta"] < 1)
         multi_Y = torch.cat([d.Y() for d in self.blockX_multiY.values()], dim=-1)
         best_f_expected = objective(multi_Y).max()
         self.assertEqual(kwargs["best_f"], best_f_expected)
@@ -376,6 +407,23 @@ class TestMCAcquisitionFunctionInputConstructors(
         )
         self.assertEqual(kwargs["best_f"], best_f_expected)
 
+        # testing qLogEI input constructor
+        log_constructor = get_acqf_input_constructor(qLogExpectedImprovement)
+        log_kwargs = log_constructor(
+            model=mock_model,
+            training_data=self.blockX_blockY,
+            objective=objective,
+            X_pending=X_pending,
+            best_f=best_f_expected,
+        )
+        # includes strict superset of kwargs tested above
+        self.assertTrue(kwargs.items() <= log_kwargs.items())
+        self.assertTrue("fat" in log_kwargs)
+        self.assertTrue("tau_max" in log_kwargs)
+        self.assertEqual(log_kwargs["tau_max"], TAU_MAX)
+        self.assertTrue("tau_relu" in log_kwargs)
+        self.assertEqual(log_kwargs["tau_relu"], TAU_RELU)
+
     def test_construct_inputs_qNEI(self):
         c = get_acqf_input_constructor(qNoisyExpectedImprovement)
         mock_model = mock.Mock()
@@ -386,6 +434,10 @@ class TestMCAcquisitionFunctionInputConstructors(
         self.assertIsNone(kwargs["sampler"])
         self.assertTrue(kwargs["prune_baseline"])
         self.assertTrue(torch.equal(kwargs["X_baseline"], self.blockX_blockY[0].X()))
+        self.assertIsNone(kwargs["constraints"])
+        self.assertIsInstance(kwargs["eta"], float)
+        self.assertTrue(kwargs["eta"] < 1)
+
         with self.assertRaisesRegex(ValueError, "Field `X` must be shared"):
             c(model=mock_model, training_data=self.multiX_multiY)
         X_baseline = torch.rand(2, 2)
@@ -401,6 +453,25 @@ class TestMCAcquisitionFunctionInputConstructors(
         self.assertIsNone(kwargs["sampler"])
         self.assertFalse(kwargs["prune_baseline"])
         self.assertTrue(torch.equal(kwargs["X_baseline"], X_baseline))
+        self.assertIsNone(kwargs["constraints"])
+        self.assertIsInstance(kwargs["eta"], float)
+        self.assertTrue(kwargs["eta"] < 1)
+
+        # testing qLogNEI input constructor
+        log_constructor = get_acqf_input_constructor(qLogNoisyExpectedImprovement)
+        log_kwargs = log_constructor(
+            model=mock_model,
+            training_data=self.blockX_blockY,
+            X_baseline=X_baseline,
+            prune_baseline=False,
+        )
+        # includes strict superset of kwargs tested above
+        self.assertTrue(kwargs.items() <= log_kwargs.items())
+        self.assertTrue("fat" in log_kwargs)
+        self.assertTrue("tau_max" in log_kwargs)
+        self.assertEqual(log_kwargs["tau_max"], TAU_MAX)
+        self.assertTrue("tau_relu" in log_kwargs)
+        self.assertEqual(log_kwargs["tau_relu"], TAU_RELU)
 
     def test_construct_inputs_qPI(self):
         c = get_acqf_input_constructor(qProbabilityOfImprovement)
@@ -411,6 +482,9 @@ class TestMCAcquisitionFunctionInputConstructors(
         self.assertIsNone(kwargs["X_pending"])
         self.assertIsNone(kwargs["sampler"])
         self.assertEqual(kwargs["tau"], 1e-3)
+        self.assertIsNone(kwargs["constraints"])
+        self.assertIsInstance(kwargs["eta"], float)
+        self.assertTrue(kwargs["eta"] < 1)
         X_pending = torch.rand(2, 2)
         objective = LinearMCObjective(torch.rand(2))
         kwargs = c(
@@ -425,6 +499,9 @@ class TestMCAcquisitionFunctionInputConstructors(
         self.assertTrue(torch.equal(kwargs["X_pending"], X_pending))
         self.assertIsNone(kwargs["sampler"])
         self.assertEqual(kwargs["tau"], 1e-2)
+        self.assertIsNone(kwargs["constraints"])
+        self.assertIsInstance(kwargs["eta"], float)
+        self.assertTrue(kwargs["eta"] < 1)
         multi_Y = torch.cat([d.Y() for d in self.blockX_multiY.values()], dim=-1)
         best_f_expected = objective(multi_Y).max()
         self.assertEqual(kwargs["best_f"], best_f_expected)
@@ -733,7 +810,7 @@ class TestMultiObjectiveAcquisitionFunctionInputConstructors(
             X_pending=X_pending,
             eta=1e-2,
             prune_baseline=True,
-            alpha=0.1,
+            alpha=0.0,
             cache_pending=False,
             max_iep=1,
             incremental_nehvi=False,
@@ -754,7 +831,7 @@ class TestMultiObjectiveAcquisitionFunctionInputConstructors(
         self.assertTrue(torch.equal(kwargs["X_pending"], X_pending))
         self.assertEqual(kwargs["eta"], 1e-2)
         self.assertTrue(kwargs["prune_baseline"])
-        self.assertEqual(kwargs["alpha"], 0.1)
+        self.assertEqual(kwargs["alpha"], 0.0)
         self.assertFalse(kwargs["cache_pending"])
         self.assertEqual(kwargs["max_iep"], 1)
         self.assertFalse(kwargs["incremental_nehvi"])
@@ -797,7 +874,7 @@ class TestMultiObjectiveAcquisitionFunctionInputConstructors(
             training_data=self.blockX_blockY,
             objective_thresholds=objective_thresholds,
         )
-        self.assertEqual(kwargs["alpha"], 1e-3)
+        self.assertEqual(kwargs["alpha"], 0.0)
 
     def test_construct_inputs_kg(self):
         current_value = torch.tensor(1.23)
