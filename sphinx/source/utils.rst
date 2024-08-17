@@ -37,6 +37,11 @@ Low-Rank Cholesky Update Utils
 .. automodule:: botorch.utils.low_rank
 		:members:
 
+Multi-Task Distribution Utils
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+.. automodule:: botorch.utils.multitask
+		:members:
+
 Objective
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 .. automodule:: botorch.utils.objective
@@ -57,10 +62,14 @@ Sampling from GP priors
 .. automodule:: botorch.utils.gp_sampling
 		:members:
 
-
 Testing
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 .. automodule:: botorch.utils.testing
+		:members:
+
+Test Helpers
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+.. automodule:: botorch.utils.test_helpers
 		:members:
 
 Torch

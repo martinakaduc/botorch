@@ -10,8 +10,9 @@ import math
 import warnings
 from abc import abstractproperty
 from collections import OrderedDict
-from typing import Any, List, Optional, Tuple, Union
-from unittest import TestCase
+from collections.abc import Sequence
+from typing import Any, Optional
+from unittest import mock, TestCase
 
 import torch
 from botorch import settings
@@ -43,30 +44,36 @@ class BotorchTestCase(TestCase):
 
     device = torch.device("cpu")
 
-    def setUp(self):
+    def setUp(self, suppress_input_warnings: bool = True) -> None:
         warnings.resetwarnings()
         settings.debug._set_state(False)
         warnings.simplefilter("always", append=True)
-        warnings.filterwarnings(
-            "ignore",
-            message="The model inputs are of type",
-            category=UserWarning,
-        )
-        warnings.filterwarnings(
-            "ignore",
-            message="Non-strict enforcement of botorch tensor conventions.",
-            category=BotorchTensorDimensionWarning,
-        )
-        warnings.filterwarnings(
-            "ignore",
-            message="Input data is not standardized.",
-            category=InputDataWarning,
-        )
+        if suppress_input_warnings:
+            warnings.filterwarnings(
+                "ignore",
+                message="The model inputs are of type",
+                category=InputDataWarning,
+            )
+            warnings.filterwarnings(
+                "ignore",
+                message="Non-strict enforcement of botorch tensor conventions.",
+                category=BotorchTensorDimensionWarning,
+            )
+            warnings.filterwarnings(
+                "ignore",
+                message="Data is not standardized.",
+                category=InputDataWarning,
+            )
+            warnings.filterwarnings(
+                "ignore",
+                message="Input data is not contained to the unit cube.",
+                category=InputDataWarning,
+            )
 
     def assertAllClose(
         self,
-        input: torch.Tensor,
-        other: Union[torch.Tensor, float],
+        input: Any,
+        other: Any,
         rtol: float = 1e-05,
         atol: float = 1e-08,
         equal_nan: bool = False,
@@ -112,7 +119,7 @@ class BaseTestProblemTestCaseMixIn:
                     self.assertEqual(res.shape, batch_shape + tail_shape)
 
     @abstractproperty
-    def functions(self) -> List[BaseTestProblem]:
+    def functions(self) -> Sequence[BaseTestProblem]:
         # The functions that should be tested. Typically defined as a class
         # attribute on the test case subclassing this class.
         pass  # pragma: no cover
@@ -123,12 +130,13 @@ class SyntheticTestFunctionTestCaseMixin:
         for dtype in (torch.float, torch.double):
             for f in self.functions:
                 f.to(device=self.device, dtype=dtype)
-                try:
+                if f._optimal_value is None:
+                    with self.assertRaisesRegex(NotImplementedError, "optimal value"):
+                        f.optimal_value
+                else:
                     optval = f.optimal_value
                     optval_exp = -f._optimal_value if f.negate else f._optimal_value
                     self.assertEqual(optval, optval_exp)
-                except NotImplementedError:
-                    pass
 
     def test_optimizer(self):
         for dtype in (torch.float, torch.double):
@@ -158,7 +166,7 @@ class MultiObjectiveTestProblemTestCaseMixin:
         for dtype in (torch.float, torch.double):
             for f in self.functions:
                 f.to(device=self.device, dtype=dtype)
-                if not hasattr(f, "_max_hv"):
+                if f._max_hv is None:
                     with self.assertRaises(NotImplementedError):
                         f.max_hv
                 else:
@@ -181,7 +189,7 @@ class ConstrainedTestProblemTestCaseMixin:
         for f in self.functions:
             self.assertTrue(hasattr(f, "num_constraints"))
 
-    def test_evaluate_slack_true(self):
+    def test_evaluate_slack(self):
         for dtype in (torch.float, torch.double):
             for f in self.functions:
                 f.to(device=self.device, dtype=dtype)
@@ -189,8 +197,31 @@ class ConstrainedTestProblemTestCaseMixin:
                     torch.rand(1, f.dim, device=self.device, dtype=dtype),
                     bounds=f.bounds,
                 )
-                slack = f.evaluate_slack_true(X)
-                self.assertEqual(slack.shape, torch.Size([1, f.num_constraints]))
+                slack_true = f.evaluate_slack_true(X)
+                # Mock out the random generator to ensure that noise realizations are
+                # sizable so we don't run into any floating point comparison issues.
+                with mock.patch(
+                    "botorch.test_functions.base.torch.randn_like",
+                    side_effect=lambda y: y,
+                ):
+                    slack_observed = f.evaluate_slack(X)
+
+                self.assertEqual(slack_true.shape, torch.Size([1, f.num_constraints]))
+                self.assertEqual(
+                    slack_observed.shape, torch.Size([1, f.num_constraints])
+                )
+                is_equal = (slack_observed == slack_true).bool()
+                if isinstance(f.constraint_noise_std, float):
+                    self.assertEqual(
+                        is_equal.all().item(), f.constraint_noise_std == 0.0
+                    )
+                elif isinstance(f.constraint_noise_std, list):
+                    for i, noise_std in enumerate(f.constraint_noise_std):
+                        self.assertEqual(
+                            is_equal[:, i].item(), noise_std in (0.0, None)
+                        )
+                else:
+                    self.assertTrue(is_equal.all().item())
 
 
 class MockPosterior(Posterior):
@@ -255,7 +286,7 @@ class MockPosterior(Posterior):
         return torch.Size()
 
     @property
-    def batch_range(self) -> Tuple[int, int]:
+    def batch_range(self) -> tuple[int, int]:
         return self._batch_range
 
     @property
@@ -269,16 +300,11 @@ class MockPosterior(Posterior):
     def rsample(
         self,
         sample_shape: Optional[torch.Size] = None,
-        base_samples: Optional[Tensor] = None,
     ) -> Tensor:
         """Mock sample by repeating self._samples. If base_samples is provided,
         do a shape check but return the same mock samples."""
         if sample_shape is None:
             sample_shape = torch.Size()
-        if sample_shape is not None and base_samples is not None:
-            # check the base_samples shape is consistent with the sample_shape
-            if base_samples.shape[: len(sample_shape)] != sample_shape:
-                raise RuntimeError("sample_shape disagrees with base_samples.")
         return self._samples.expand(sample_shape + self._samples.shape)
 
     def rsample_from_base_samples(
@@ -286,7 +312,12 @@ class MockPosterior(Posterior):
         sample_shape: torch.Size,
         base_samples: Tensor,
     ) -> Tensor:
-        return self.rsample(sample_shape, base_samples)
+        if base_samples.shape[: len(sample_shape)] != sample_shape:
+            raise RuntimeError(
+                "`sample_shape` disagrees with shape of `base_samples`. "
+                f"Got {sample_shape=} and {base_samples.shape=}."
+            )
+        return self.rsample(sample_shape)
 
 
 @GetSampler.register(MockPosterior)
@@ -307,7 +338,7 @@ class MockModel(Model, FantasizeMixin):
     def posterior(
         self,
         X: Tensor,
-        output_indices: Optional[List[int]] = None,
+        output_indices: Optional[list[int]] = None,
         posterior_transform: Optional[PosteriorTransform] = None,
         observation_noise: bool = False,
     ) -> MockPosterior:
@@ -351,7 +382,7 @@ class MockAcquisitionFunction:
 
 def _get_random_data(
     batch_shape: torch.Size, m: int, d: int = 1, n: int = 10, **tkwargs
-) -> Tuple[Tensor, Tensor]:
+) -> tuple[Tensor, Tensor]:
     r"""Generate random data for testing purposes.
 
     Args:
@@ -369,6 +400,7 @@ def _get_random_data(
         [torch.linspace(0, 0.95, n, **tkwargs) for _ in range(d)], dim=-1
     )
     train_x = train_x + 0.05 * torch.rand_like(train_x).repeat(rep_shape)
+    train_x[0] += 0.02  # modify the first batch
     train_y = torch.sin(train_x[..., :1] * (2 * math.pi))
     train_y = train_y + 0.2 * torch.randn(n, m, **tkwargs).repeat(rep_shape)
     return train_x, train_y
@@ -442,7 +474,7 @@ def _get_max_violation_of_bounds(samples: torch.Tensor, bounds: torch.Tensor) ->
 
 def _get_max_violation_of_constraints(
     samples: torch.Tensor,
-    constraints: Optional[List[Tuple[Tensor, Tensor, float]]],
+    constraints: Optional[list[tuple[Tensor, Tensor, float]]],
     equality: bool,
 ) -> float:
     r"""
@@ -460,7 +492,7 @@ def _get_max_violation_of_constraints(
     n, q, d = samples.shape
     max_error = 0
     if constraints is not None:
-        for (ind, coef, rhs) in constraints:
+        for ind, coef, rhs in constraints:
             if ind.ndim == 1:
                 constr = samples[:, :, ind] @ coef
             else:

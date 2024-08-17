@@ -10,20 +10,31 @@ Utilities for converting between different models.
 
 from __future__ import annotations
 
+import warnings
 from copy import deepcopy
-from typing import Dict, Optional, Set, Tuple
+from typing import Optional
 
 import torch
 from botorch.exceptions import UnsupportedError
-from botorch.models.gp_regression import FixedNoiseGP, HeteroskedasticSingleTaskGP
+from botorch.exceptions.warnings import BotorchWarning
+from botorch.models import SingleTaskGP
+from botorch.models.gp_regression import HeteroskedasticSingleTaskGP
 from botorch.models.gp_regression_fidelity import SingleTaskMultiFidelityGP
 from botorch.models.gp_regression_mixed import MixedSingleTaskGP
 from botorch.models.gpytorch import BatchedMultiOutputGPyTorchModel
 from botorch.models.model_list_gp_regression import ModelListGP
 from botorch.models.transforms.input import InputTransform
 from botorch.models.transforms.outcome import OutcomeTransform
+from gpytorch.likelihoods.gaussian_likelihood import FixedNoiseGaussianLikelihood
 from torch import Tensor
-from torch.nn import Module
+from torch.nn import Module, ModuleList
+
+DEPRECATION_MESSAGE = (
+    "Model converter code is deprecated and will be removed in v0.13 release. "
+    "Its correct behavior is dependent on some assumptions about model priors "
+    "that do not always hold. Use it at your own risk! See "
+    "https://github.com/cornellius-gp/gpytorch/issues/2550."
+)
 
 
 def _get_module(module: Module, name: str) -> Module:
@@ -48,14 +59,24 @@ def _get_module(module: Module, name: str) -> Module:
     return current
 
 
-def _check_compatibility(models: ModelListGP) -> None:
-    """Check if a ModelListGP can be converted."""
+def _check_compatibility(models: ModuleList) -> None:
+    """Check if the submodels of a ModelListGP are compatible with the converter."""
     # Check that all submodules are of the same type.
     for modn, mod in models[0].named_modules():
         mcls = mod.__class__
         if not all(isinstance(_get_module(m, modn), mcls) for m in models[1:]):
             raise UnsupportedError(
                 "Sub-modules must be of the same type across models."
+            )
+        if "prior" in modn and len(mod.state_dict()) == 0:
+            warnings.warn(  # pragma no cover -- not tested after GPyTorch 2551.
+                "Model converter cannot verify compatibility of GPyTorch priors "
+                "that do not register their parameters as buffers. If the prior "
+                "is different than the default prior set by the model constructor "
+                "this may not work correctly. Use it at your own risk! See "
+                "https://github.com/cornellius-gp/gpytorch/issues/2550.",
+                BotorchWarning,
+                stacklevel=3,
             )
 
     # Check that each model is a BatchedMultiOutputGPyTorchModel.
@@ -79,7 +100,8 @@ def _check_compatibility(models: ModelListGP) -> None:
     # TODO: Add support for outcome transforms.
     if any(getattr(m, "outcome_transform", None) is not None for m in models):
         raise UnsupportedError(
-            "Conversion of models with outcome transforms is currently unsupported."
+            "Conversion of models with outcome transforms is unsupported. "
+            "To fix this error, explicitly pass `outcome_transform=None`.",
         )
 
     # check that each model is single-output
@@ -127,6 +149,7 @@ def model_list_to_batched(model_list: ModelListGP) -> BatchedMultiOutputGPyTorch
         >>> list_gp = ModelListGP(gp1, gp2)
         >>> batch_gp = model_list_to_batched(list_gp)
     """
+    warnings.warn(DEPRECATION_MESSAGE, DeprecationWarning, stacklevel=2)
     was_training = model_list.training
     model_list.train()
     models = model_list.models
@@ -140,7 +163,7 @@ def model_list_to_batched(model_list: ModelListGP) -> BatchedMultiOutputGPyTorch
     train_X = deepcopy(models[0].train_inputs[0])
     train_Y = torch.stack([m.train_targets.clone() for m in models], dim=-1)
     kwargs = {"train_X": train_X, "train_Y": train_Y}
-    if isinstance(models[0], FixedNoiseGP):
+    if isinstance(models[0].likelihood, FixedNoiseGaussianLikelihood):
         kwargs["train_Yvar"] = torch.stack(
             [m.likelihood.noise_covar.noise.clone() for m in models], dim=-1
         )
@@ -158,6 +181,11 @@ def model_list_to_batched(model_list: ModelListGP) -> BatchedMultiOutputGPyTorch
         batch_length = len(models)
         covar_module = _batched_kernel(models[0].covar_module, batch_length)
         kwargs["covar_module"] = covar_module
+    # SingleTaskGP uses a default outcome transforms while this converter doesn't
+    # support outcome transforms. We need to explicitly pass down `None` to make
+    # sure no outcome transform is being used.
+    if isinstance(models[0], SingleTaskGP):
+        kwargs["outcome_transform"] = None
 
     # construct the batched GP model
     input_transform = getattr(models[0], "input_transform", None)
@@ -259,6 +287,7 @@ def batched_to_model_list(batch_model: BatchedMultiOutputGPyTorchModel) -> Model
         >>> batch_gp = SingleTaskGP(train_X, train_Y)
         >>> list_gp = batched_to_model_list(batch_gp)
     """
+    warnings.warn(DEPRECATION_MESSAGE, DeprecationWarning, stacklevel=2)
     was_training = batch_model.training
     batch_model.train()
     # TODO: Add support for HeteroskedasticSingleTaskGP.
@@ -302,7 +331,7 @@ def batched_to_model_list(batch_model: BatchedMultiOutputGPyTorchModel) -> Model
             .clone()
             .unsqueeze(-1),
         }
-        if isinstance(batch_model, FixedNoiseGP):
+        if isinstance(batch_model.likelihood, FixedNoiseGaussianLikelihood):
             noise_covar = batch_model.likelihood.noise_covar
             kwargs["train_Yvar"] = (
                 noise_covar.noise.select(input_bdims, i).clone().unsqueeze(-1)
@@ -362,6 +391,7 @@ def batched_multi_output_to_single_output(
         >>> batch_mo_gp = SingleTaskGP(train_X, train_Y)
         >>> batch_so_gp = batched_multioutput_to_single_output(batch_gp)
     """
+    warnings.warn(DEPRECATION_MESSAGE, DeprecationWarning, stacklevel=2)
     was_training = batch_mo_model.training
     batch_mo_model.train()
     # TODO: Add support for HeteroskedasticSingleTaskGP.
@@ -390,11 +420,17 @@ def batched_multi_output_to_single_output(
         "train_X": batch_mo_model.train_inputs[0].clone(),
         "train_Y": batch_mo_model.train_targets.clone().unsqueeze(-1),
     }
-    if isinstance(batch_mo_model, FixedNoiseGP):
+    if isinstance(batch_mo_model.likelihood, FixedNoiseGaussianLikelihood):
         noise_covar = batch_mo_model.likelihood.noise_covar
         kwargs["train_Yvar"] = noise_covar.noise.clone().unsqueeze(-1)
     if isinstance(batch_mo_model, SingleTaskMultiFidelityGP):
         kwargs.update(batch_mo_model._init_args)
+    # SingleTaskGP uses a default outcome transforms while this converter doesn't
+    # support outcome transforms. We need to explicitly pass down `None` to make
+    # sure no outcome transform is being used.
+    if isinstance(batch_mo_model, SingleTaskGP):
+        kwargs["outcome_transform"] = None
+
     single_outcome_model = batch_mo_model.__class__(
         input_transform=input_transform, **kwargs
     )
@@ -403,10 +439,10 @@ def batched_multi_output_to_single_output(
 
 
 def _get_adjusted_batch_keys(
-    batch_state_dict: Dict[str, Tensor],
+    batch_state_dict: dict[str, Tensor],
     input_transform: Optional[InputTransform],
     outcome_transform: Optional[OutcomeTransform] = None,
-) -> Tuple[Set[str], Set[str]]:
+) -> tuple[set[str], set[str]]:
     r"""Group the keys based on whether the value requires batch shape changes.
 
     Args:

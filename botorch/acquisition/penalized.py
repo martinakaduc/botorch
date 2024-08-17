@@ -11,7 +11,7 @@ Modules to add regularization to acquisition functions.
 from __future__ import annotations
 
 import math
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, Optional
 
 import torch
 from botorch.acquisition.acquisition import AcquisitionFunction
@@ -44,7 +44,8 @@ class L2Penalty(torch.nn.Module):
             A tensor of size "batch_shape" representing the acqfn for each q-batch.
         """
         regularization_term = (
-            torch.norm((X - self.init_point), p=2, dim=-1).max(dim=-1).values ** 2
+            torch.linalg.norm((X - self.init_point), ord=2, dim=-1).max(dim=-1).values
+            ** 2
         )
         return regularization_term
 
@@ -72,7 +73,7 @@ class L1Penalty(torch.nn.Module):
             A tensor of size "batch_shape" representing the acqfn for each q-batch.
         """
         regularization_term = (
-            torch.norm((X - self.init_point), p=1, dim=-1).max(dim=-1).values
+            torch.linalg.norm((X - self.init_point), ord=1, dim=-1).max(dim=-1).values
         )
         return regularization_term
 
@@ -101,7 +102,7 @@ class GaussianPenalty(torch.nn.Module):
         Returns:
             A tensor of size "batch_shape" representing the acqfn for each q-batch.
         """
-        sq_diff = torch.norm((X - self.init_point), p=2, dim=-1) ** 2
+        sq_diff = torch.linalg.norm((X - self.init_point), ord=2, dim=-1) ** 2
         pdf = torch.exp(sq_diff / 2 / self.sigma**2)
         regularization_term = pdf.max(dim=-1).values
         return regularization_term
@@ -111,7 +112,7 @@ class GroupLassoPenalty(torch.nn.Module):
     r"""Group lasso penalty class to be added to any arbitrary acquisition function
     to construct a PenalizedAcquisitionFunction."""
 
-    def __init__(self, init_point: Tensor, groups: List[List[int]]):
+    def __init__(self, init_point: Tensor, groups: list[list[int]]):
         r"""Initializing Group-Lasso regularization.
 
         Args:
@@ -245,7 +246,7 @@ class PenalizedAcquisitionFunction(AcquisitionFunction):
             )
 
 
-def group_lasso_regularizer(X: Tensor, groups: List[List[int]]) -> Tensor:
+def group_lasso_regularizer(X: Tensor, groups: list[list[int]]) -> Tensor:
     r"""Computes the group lasso regularization function for the given point.
 
     Args:
@@ -257,7 +258,10 @@ def group_lasso_regularizer(X: Tensor, groups: List[List[int]]) -> Tensor:
     """
     return torch.sum(
         torch.stack(
-            [math.sqrt(len(g)) * torch.norm(X[..., g], p=2, dim=-1) for g in groups],
+            [
+                math.sqrt(len(g)) * torch.linalg.norm(X[..., g], ord=2, dim=-1)
+                for g in groups
+            ],
             dim=-1,
         ),
         dim=-1,
@@ -289,13 +293,13 @@ class L1PenaltyObjective(torch.nn.Module):
             A "1 x batch_shape x q" tensor representing the penalty for each point.
             The first dimension corresponds to the dimension of MC samples.
         """
-        return torch.norm((X - self.init_point), p=1, dim=-1).unsqueeze(dim=0)
+        return torch.linalg.norm((X - self.init_point), ord=1, dim=-1).unsqueeze(dim=0)
 
 
 class PenalizedMCObjective(GenericMCObjective):
     r"""Penalized MC objective.
 
-    Allows to construct a penaltized MC-objective by adding a penalty term to
+    Allows to construct a penalized MC-objective by adding a penalty term to
     the original objective.
 
         mc_acq(X) = objective(X) + penalty_objective(X)
@@ -362,6 +366,12 @@ class PenalizedMCObjective(GenericMCObjective):
         if self.expand_dim is not None:
             # reshape penalty_obj to match the dim
             penalty_obj = penalty_obj.unsqueeze(self.expand_dim)
+        # this happens when samples is a `q x m`-dim tensor and X is a `q x d`-dim
+        # tensor; obj returned from GenericMCObjective is a `q`-dim tensor and
+        # penalty_obj is a `1 x q`-dim tensor.
+        if obj.ndim == 1:
+            assert penalty_obj.shape == torch.Size([1, samples.shape[-2]])
+            penalty_obj = penalty_obj.squeeze(dim=0)
         return obj - self.regularization_parameter * penalty_obj
 
 

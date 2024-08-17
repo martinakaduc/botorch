@@ -74,6 +74,11 @@ Multi-Objective Analytic Acquisition Functions
     :members:
     :exclude-members: MultiObjectiveAnalyticAcquisitionFunction
 
+Multi-Objective Hypervolume Knowledge Gradient Acquisition Functions
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+.. automodule:: botorch.acquisition.multi_objective.hypervolume_knowledge_gradient
+    :members:
+
 Multi-Objective Joint Entropy Search Acquisition Functions
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 .. automodule:: botorch.acquisition.multi_objective.joint_entropy_search
@@ -90,6 +95,9 @@ Multi-Objective Monte-Carlo Acquisition Functions
     :members:
     :exclude-members: MultiObjectiveMCAcquisitionFunction
 
+.. automodule:: botorch.acquisition.multi_objective.logei
+    :members:
+
 Multi-Objective Multi-Fidelity Acquisition Functions
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 .. automodule:: botorch.acquisition.multi_objective.multi_fidelity
@@ -98,6 +106,11 @@ Multi-Objective Multi-Fidelity Acquisition Functions
 Multi-Objective Predictive Entropy Search Acquisition Functions
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 .. automodule:: botorch.acquisition.multi_objective.predictive_entropy_search
+    :members:
+
+ParEGO: Multi-Objective Acquisition Function with Chebyshev Scalarization
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+.. automodule:: botorch.acquisition.multi_objective.parego
     :members:
 
 The One-Shot Knowledge Gradient
@@ -135,11 +148,15 @@ Active Learning Acquisition Functions
 .. automodule:: botorch.acquisition.active_learning
     :members:
 
+Bayesian Active Learning Acquisition Functions
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+.. automodule:: botorch.acquisition.bayesian_active_learning
+    :members:
+
 Preference Acquisition Functions
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 .. automodule:: botorch.acquisition.preference
     :members:
-
 
 Objectives and Cost-Aware Utilities
 -------------------------------------------
@@ -162,6 +179,11 @@ Cost-Aware Utility
 Risk Measures
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 .. automodule:: botorch.acquisition.risk_measures
+    :members:
+
+Thompson Sampling
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+.. automodule:: botorch.acquisition.thompson_sampling
     :members:
 
 Multi-Output Risk Measures
@@ -198,11 +220,15 @@ Proximal Acquisition Function Wrapper
 .. automodule:: botorch.acquisition.proximal
     :members:
 
+Factory Functions for Acquisition Functions
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+.. automodule:: botorch.acquisition.factory
+    :members:
+
 General Utilities for Acquisition Functions
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 .. automodule:: botorch.acquisition.utils
     :members:
-
 
 Multi-Objective Utilities for Acquisition Functions
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

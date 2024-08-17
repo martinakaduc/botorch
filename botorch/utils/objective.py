@@ -10,12 +10,11 @@ Helpers for handling objectives.
 
 from __future__ import annotations
 
-import warnings
-
-from typing import Callable, List, Optional, Union
+from typing import Callable, Optional, Union
 
 import torch
 from botorch.utils.safe_math import log_fatmoid, logexpit
+from botorch.utils.transforms import normalize_indices
 from torch import Tensor
 
 
@@ -42,9 +41,6 @@ def get_objective_weights_transform(
         >>> weights = torch.tensor([0.75, 0.25])
         >>> transform = get_objective_weights_transform(weights)
     """
-    # if no weights provided, just extract the single output
-    if weights is None:
-        return lambda Y: Y.squeeze(-1)
 
     def _objective(Y: Tensor, X: Optional[Tensor] = None):
         r"""Evaluate objective.
@@ -54,10 +50,14 @@ def get_objective_weights_transform(
 
         Args:
             Y: A `... x b x q x m` tensor of function values.
+            X: Ignored.
 
         Returns:
             A `... x b x q`-dim tensor of objective values.
         """
+        # if no weights provided, just extract the single output
+        if weights is None:
+            return Y.squeeze(-1)
         return torch.einsum("...m, m", [Y, weights])
 
     return _objective
@@ -65,7 +65,7 @@ def get_objective_weights_transform(
 
 def apply_constraints_nonnegative_soft(
     obj: Tensor,
-    constraints: List[Callable[[Tensor], Tensor]],
+    constraints: list[Callable[[Tensor], Tensor]],
     samples: Tensor,
     eta: Union[Tensor, float],
 ) -> Tensor:
@@ -99,8 +99,9 @@ def apply_constraints_nonnegative_soft(
 
 
 def compute_feasibility_indicator(
-    constraints: Optional[List[Callable[[Tensor], Tensor]]],
+    constraints: Optional[list[Callable[[Tensor], Tensor]]],
     samples: Tensor,
+    marginalize_dim: Optional[int] = None,
 ) -> Tensor:
     r"""Computes the feasibility of a list of constraints given posterior samples.
 
@@ -108,6 +109,9 @@ def compute_feasibility_indicator(
         constraints: A list of callables, each mapping a batch_shape x q x m`-dim Tensor
             to a `batch_shape x q`-dim Tensor, where negative values imply feasibility.
         samples: A batch_shape x q x m`-dim Tensor of posterior samples.
+        marginalize_dim: A batch dimension that should be marginalized.
+            For example, this is useful when using a batched fully Bayesian
+            model.
 
     Returns:
         A `batch_shape x q`-dim tensor of Boolean feasibility values.
@@ -115,12 +119,20 @@ def compute_feasibility_indicator(
     ind = torch.ones(samples.shape[:-1], dtype=torch.bool, device=samples.device)
     if constraints is not None:
         for constraint in constraints:
-            ind = ind.logical_and(constraint(samples) < 0)
+            ind = ind.logical_and(constraint(samples) <= 0)
+    if ind.ndim >= 3 and marginalize_dim is not None:
+        # make sure marginalize_dim is not negative
+        if marginalize_dim < 0:
+            # add 1 to the normalize marginalize_dim since we have already
+            # removed the output dim
+            marginalize_dim = 1 + normalize_indices([marginalize_dim], d=ind.ndim)[0]
+
+        ind = ind.float().mean(dim=marginalize_dim).round().bool()
     return ind
 
 
 def compute_smoothed_feasibility_indicator(
-    constraints: List[Callable[[Tensor], Tensor]],
+    constraints: list[Callable[[Tensor], Tensor]],
     samples: Tensor,
     eta: Union[Tensor, float],
     log: bool = False,
@@ -168,35 +180,9 @@ def compute_smoothed_feasibility_indicator(
     return is_feasible if log else is_feasible.exp()
 
 
-# TODO: deprecate this function
-def soft_eval_constraint(lhs: Tensor, eta: float = 1e-3) -> Tensor:
-    r"""Element-wise evaluation of a constraint in a 'soft' fashion
-
-    `value(x) = 1 / (1 + exp(x / eta))`
-
-    Args:
-        lhs: The left hand side of the constraint `lhs <= 0`.
-        eta: The temperature parameter of the softmax function. As eta
-            decreases, this approximates the Heaviside step function.
-
-    Returns:
-        Element-wise 'soft' feasibility indicator of the same shape as `lhs`.
-        For each element `x`, `value(x) -> 0` as `x` becomes positive, and
-        `value(x) -> 1` as x becomes negative.
-    """
-    warnings.warn(
-        "`soft_eval_constraint` is deprecated. Please consider `torch.utils.sigmoid` "
-        + "with its `fat` and `log` options to compute feasibility indicators.",
-        DeprecationWarning,
-    )
-    if eta <= 0:
-        raise ValueError("eta must be positive.")
-    return torch.sigmoid(-lhs / eta)
-
-
 def apply_constraints(
     obj: Tensor,
-    constraints: List[Callable[[Tensor], Tensor]],
+    constraints: list[Callable[[Tensor], Tensor]],
     samples: Tensor,
     infeasible_cost: float,
     eta: Union[Tensor, float] = 1e-3,

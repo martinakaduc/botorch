@@ -15,31 +15,26 @@ from __future__ import annotations
 import warnings
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from copy import deepcopy
-from typing import (
-    Any,
-    Callable,
-    Dict,
-    Hashable,
-    List,
-    Mapping,
-    Optional,
-    TYPE_CHECKING,
-    TypeVar,
-    Union,
-)
+from collections.abc import Mapping
+from typing import Any, Callable, Optional, TYPE_CHECKING, TypeVar, Union
 
 import numpy as np
 import torch
 from botorch import settings
-from botorch.exceptions.errors import BotorchTensorDimensionError, InputDataError
+from botorch.exceptions.errors import (
+    BotorchTensorDimensionError,
+    DeprecationError,
+    InputDataError,
+)
 from botorch.logging import shape_to_str
 from botorch.models.utils.assorted import fantasize as fantasize_flag
 from botorch.posteriors import Posterior, PosteriorList
 from botorch.sampling.base import MCSampler
 from botorch.sampling.list_sampler import ListSampler
-from botorch.utils.datasets import BotorchDataset
+from botorch.utils.containers import BotorchContainer
+from botorch.utils.datasets import SupervisedDataset
 from botorch.utils.transforms import is_fully_bayesian
+from gpytorch.likelihoods.gaussian_likelihood import FixedNoiseGaussianLikelihood
 from torch import Tensor
 from torch.nn import Module, ModuleDict, ModuleList
 
@@ -65,26 +60,31 @@ class Model(Module, ABC):
     `Tensor` or `Module` type are automatically registered so they can be moved and/or
     cast with the `to` method, automatically differentiated, and used with CUDA.
 
-    Args:
+    Attributes:
         _has_transformed_inputs: A boolean denoting whether `train_inputs` are currently
             stored as transformed or not.
         _original_train_inputs: A Tensor storing the original train inputs for use in
             `_revert_to_original_inputs`. Note that this is necessary since
             transform / untransform cycle introduces numerical errors which lead
             to upstream errors during training.
+        _is_fully_bayesian: Returns `True` if this is a fully Bayesian model.
+        _is_ensemble: Returns `True` if this model consists of multiple models
+            that are stored in an additional batch dimension. This is true for the fully
+            Bayesian models.
     """  # noqa: E501
 
     _has_transformed_inputs: bool = False
     _original_train_inputs: Optional[Tensor] = None
+    _is_fully_bayesian = False
+    _is_ensemble = False
 
     @abstractmethod
     def posterior(
         self,
         X: Tensor,
-        output_indices: Optional[List[int]] = None,
-        observation_noise: bool = False,
+        output_indices: Optional[list[int]] = None,
+        observation_noise: Union[bool, Tensor] = False,
         posterior_transform: Optional[PosteriorTransform] = None,
-        **kwargs: Any,
     ) -> Posterior:
         r"""Computes the posterior over model outputs at the provided points.
 
@@ -101,7 +101,12 @@ class Model(Module, ABC):
                 Can be used to speed up computation if only a subset of the
                 model's outputs are required for optimization. If omitted,
                 computes the posterior over all model outputs.
-            observation_noise: If True, add observation noise to the posterior.
+            observation_noise: For models with an inferred noise level, if True,
+                include observation noise. For models with an observed noise level,
+                this must be a `model_batch_shape x 1 x m`-dim tensor or
+                a `model_batch_shape x n' x m`-dim tensor containing the average
+                noise for each batch and output. `noise` must be in the
+                outcome-transformed space if an outcome transform is used.
             posterior_transform: An optional PosteriorTransform.
 
         Returns:
@@ -129,7 +134,7 @@ class Model(Module, ABC):
         cls_name = self.__class__.__name__
         raise NotImplementedError(f"{cls_name} does not define num_outputs property")
 
-    def subset_output(self, idcs: List[int]) -> Model:
+    def subset_output(self, idcs: list[int]) -> Model:
         r"""Subset the model along the output dimension.
 
         Args:
@@ -169,13 +174,28 @@ class Model(Module, ABC):
     @classmethod
     def construct_inputs(
         cls,
-        training_data: Union[BotorchDataset, Dict[Hashable, BotorchDataset]],
-        **kwargs: Any,
-    ) -> Dict[str, Any]:
-        r"""Construct `Model` keyword arguments from a dict of `BotorchDataset`."""
-        from botorch.models.utils.parse_training_data import parse_training_data
+        training_data: SupervisedDataset,
+    ) -> dict[str, Union[BotorchContainer, Tensor]]:
+        """
+        Construct `Model` keyword arguments from a `SupervisedDataset`.
 
-        return parse_training_data(cls, training_data, **kwargs)
+        Args:
+            training_data: A `SupervisedDataset`, with attributes `train_X`,
+                `train_Y`, and, optionally, `train_Yvar`.
+
+        Returns:
+            A dict of keyword arguments that can be used to initialize a `Model`,
+            with keys `train_X`, `train_Y`, and, optionally, `train_Yvar`.
+        """
+        if not isinstance(training_data, SupervisedDataset):
+            raise TypeError(
+                "Expected `training_data` to be a `SupervisedDataset`, but got "
+                f"{type(training_data)}."
+            )
+        parsed_data = {"train_X": training_data.X, "train_Y": training_data.Y}
+        if training_data.Yvar is not None:
+            parsed_data["train_Yvar"] = training_data.Yvar
+        return parsed_data
 
     def transform_inputs(
         self,
@@ -244,6 +264,10 @@ class Model(Module, ABC):
             self._set_transformed_inputs()
         return super().train(mode=mode)
 
+    @property
+    def dtypes_of_buffers(self) -> set[torch.dtype]:
+        return {t.dtype for t in self.buffers() if t is not None}
+
 
 class FantasizeMixin(ABC):
     """
@@ -266,7 +290,9 @@ class FantasizeMixin(ABC):
 
     @abstractmethod
     def condition_on_observations(
-        self: TFantasizeMixin, X: Tensor, Y: Tensor, **kwargs: Any
+        self: TFantasizeMixin,
+        X: Tensor,
+        Y: Tensor,
     ) -> TFantasizeMixin:
         """
         Classes that inherit from `FantasizeMixin` must implement
@@ -279,7 +305,6 @@ class FantasizeMixin(ABC):
         X: Tensor,
         *args,
         observation_noise: bool = False,
-        **kwargs: Any,
     ) -> Posterior:
         """
         Classes that inherit from `FantasizeMixin` must implement
@@ -302,17 +327,17 @@ class FantasizeMixin(ABC):
     # 'Self', but at this point the verbose 'T...' syntax is needed.
     def fantasize(
         self: TFantasizeMixin,
-        # TODO: see if any of these can be imported only if TYPE_CHECKING
         X: Tensor,
         sampler: MCSampler,
-        observation_noise: bool = True,
+        observation_noise: Optional[Tensor] = None,
         **kwargs: Any,
     ) -> TFantasizeMixin:
         r"""Construct a fantasy model.
 
         Constructs a fantasy model in the following fashion:
-        (1) compute the model posterior at `X` (including observation noise if
-        `observation_noise=True`).
+        (1) compute the model posterior at `X`, including observation noise.
+        If `observation_noise` is a Tensor, use it directly as the observation
+        noise to add.
         (2) sample from this posterior (using `sampler`) to generate "fake"
         observations.
         (3) condition the model on the new fake observations.
@@ -323,12 +348,32 @@ class FantasizeMixin(ABC):
                 `batch_shape` is the batch shape (must be compatible with the
                 batch shape of the model).
             sampler: The sampler used for sampling from the posterior at `X`.
-            observation_noise: If True, include observation noise.
+            observation_noise: A `model_batch_shape x 1 x m`-dim tensor or
+                a `model_batch_shape x n' x m`-dim tensor containing the average
+                noise for each batch and output, where `m` is the number of outputs.
+                `noise` must be in the outcome-transformed space if an outcome
+                transform is used.
+                If None and using an inferred noise likelihood, the noise will be the
+                inferred noise level. If using a fixed noise likelihood, the mean across
+                the observation noise in the training data is used as observation noise.
             kwargs: Will be passed to `model.condition_on_observations`
 
         Returns:
             The constructed fantasy model.
         """
+        if not isinstance(observation_noise, Tensor) and observation_noise is not None:
+            raise DeprecationError(
+                "`fantasize` no longer accepts a boolean for `observation_noise`."
+            )
+        elif observation_noise is None and isinstance(
+            self.likelihood, FixedNoiseGaussianLikelihood
+        ):
+            if self.num_outputs > 1:
+                # make noise ... x n x m
+                observation_noise = self.likelihood.noise.transpose(-1, -2)
+            else:
+                observation_noise = self.likelihood.noise.unsqueeze(-1)
+            observation_noise = observation_noise.mean(dim=-2, keepdim=True)
         # if the inputs are empty, expand the inputs
         if X.shape[-2] == 0:
             output_shape = (
@@ -337,16 +382,26 @@ class FantasizeMixin(ABC):
                 + self.batch_shape
                 + torch.Size([0, self.num_outputs])
             )
+            Y = torch.empty(output_shape, dtype=X.dtype, device=X.device)
+            if observation_noise is not None:
+                kwargs["noise"] = observation_noise.expand(Y.shape[1:])
             return self.condition_on_observations(
                 X=self.transform_inputs(X),
-                Y=torch.empty(output_shape, dtype=X.dtype, device=X.device),
+                Y=Y,
                 **kwargs,
             )
         propagate_grads = kwargs.pop("propagate_grads", False)
         with fantasize_flag():
             with settings.propagate_grads(propagate_grads):
-                post_X = self.posterior(X, observation_noise=observation_noise)
+                post_X = self.posterior(
+                    X,
+                    observation_noise=(
+                        True if observation_noise is None else observation_noise
+                    ),
+                )
             Y_fantasized = sampler(post_X)  # num_fantasies x batch_shape x n' x m
+            if observation_noise is not None:
+                kwargs["noise"] = observation_noise.expand(Y_fantasized.shape[1:])
             return self.condition_on_observations(
                 X=self.transform_inputs(X), Y=Y_fantasized, **kwargs
             )
@@ -378,8 +433,8 @@ class ModelList(Model):
         self.models = ModuleList(models)
 
     def _get_group_subset_indices(
-        self, idcs: Optional[List[int]]
-    ) -> Dict[int, List[int]]:
+        self, idcs: Optional[list[int]]
+    ) -> dict[int, list[int]]:
         r"""Convert global subset indices to indices for the individual models.
 
         Args:
@@ -395,9 +450,9 @@ class ModelList(Model):
         output_sizes = [model.num_outputs for model in self.models]
         cum_output_sizes = np.cumsum(output_sizes)
         idcs = [idx % cum_output_sizes[-1] for idx in idcs]
-        group_indices: Dict[int, List[int]] = defaultdict(list)
+        group_indices: dict[int, list[int]] = defaultdict(list)
         for idx in idcs:
-            grp_idx = int(np.argwhere(idx < cum_output_sizes)[0])
+            grp_idx = np.argwhere(idx < cum_output_sizes)[0].item()
             sub_idx = idx - int(np.sum(output_sizes[:grp_idx]))
             group_indices[grp_idx].append(sub_idx)
         return group_indices
@@ -405,10 +460,9 @@ class ModelList(Model):
     def posterior(
         self,
         X: Tensor,
-        output_indices: Optional[List[int]] = None,
+        output_indices: Optional[list[int]] = None,
         observation_noise: Union[bool, Tensor] = False,
         posterior_transform: Optional[Callable[[PosteriorList], Posterior]] = None,
-        **kwargs: Any,
     ) -> Posterior:
         r"""Computes the posterior over model outputs at the provided points.
 
@@ -429,7 +483,9 @@ class ModelList(Model):
                 respective likelihoods to the posterior. If a Tensor of shape
                 `(batch_shape) x q x m`, use it directly as the observation
                 noise (with `observation_noise[...,i]` added to the posterior
-                of the `i`-th model).
+                of the `i`-th model). `observation_noise` is assumed
+                to be in the outcome-transformed space, if an outcome transform
+                is used by the model.
             posterior_transform: An optional PosteriorTransform.
 
         Returns:
@@ -485,7 +541,7 @@ class ModelList(Model):
         """
         return sum(model.num_outputs for model in self.models)
 
-    def subset_output(self, idcs: List[int]) -> Model:
+    def subset_output(self, idcs: list[int]) -> Model:
         r"""Subset the model along the output dimension.
 
         Args:
@@ -505,15 +561,17 @@ class ModelList(Model):
         the model `m1` subset to its second output.
         """
         group_indices = self._get_group_subset_indices(idcs=idcs)
-        subset_models = [
-            deepcopy(self.models[grp_idx].subset_output(idcs=sub_idcs))
-            for grp_idx, sub_idcs in group_indices.items()
-        ]
+        subset_models = []
+        for grp_idx, sub_idcs in group_indices.items():
+            subset_model = self.models[grp_idx]
+            if sub_idcs is not None and subset_model.num_outputs != len(sub_idcs):
+                subset_model = subset_model.subset_output(idcs=sub_idcs)
+            subset_models.append(subset_model)
         if len(subset_models) == 1:
             return subset_models[0]
         return self.__class__(*subset_models)
 
-    def transform_inputs(self, X: Tensor) -> List[Tensor]:
+    def transform_inputs(self, X: Tensor) -> list[Tensor]:
         r"""Individually transform the inputs for each model.
 
         Args:
@@ -548,7 +606,7 @@ class ModelList(Model):
         self,
         X: Tensor,
         sampler: MCSampler,
-        observation_noise: bool = True,
+        observation_noise: Optional[Tensor] = None,
         evaluation_mask: Optional[Tensor] = None,
         **kwargs: Any,
     ) -> Model:
@@ -568,7 +626,12 @@ class ModelList(Model):
                 batch shape of the model).
             sampler: The sampler used for sampling from the posterior at `X`. If
                 evaluation_mask is not None, this must be a `ListSampler`.
-            observation_noise: If True, include observation noise.
+            observation_noise: A `model_batch_shape x 1 x m`-dim tensor or
+                a `model_batch_shape x n' x m`-dim tensor containing the average
+                noise for each batch and output, where `m` is the number of outputs.
+                `noise` must be in the outcome-transformed space if an outcome
+                transform is used. If None, then the noise will be the inferred
+                noise level.
             evaluation_mask: A `n' x m`-dim tensor of booleans indicating which
                 outputs should be fantasized for a given design. This uses the same
                 evaluation mask for all batches.
@@ -590,6 +653,8 @@ class ModelList(Model):
 
         fant_models = []
         X_i = X
+        if observation_noise is None:
+            observation_noise_i = observation_noise
         for i in range(self.num_outputs):
             # get the inputs to fantasize at for output i
             if evaluation_mask is not None:
@@ -599,12 +664,17 @@ class ModelList(Model):
                 # samples from a single Sobol sequence or consider requiring that the
                 # sampling is IID to ensure good coverage.
                 sampler_i = sampler.samplers[i]
+                if observation_noise is not None:
+                    observation_noise_i = observation_noise[..., mask_i, i : i + 1]
             else:
-                sampler_i = sampler
+                sampler_i = (
+                    sampler.samplers[i] if isinstance(sampler, ListSampler) else sampler
+                )
+
             fant_model = self.models[i].fantasize(
                 X=X_i,
                 sampler=sampler_i,
-                observation_noise=observation_noise,
+                observation_noise=observation_noise_i,
                 **kwargs,
             )
             fant_models.append(fant_model)

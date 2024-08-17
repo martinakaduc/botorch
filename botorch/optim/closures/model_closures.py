@@ -8,12 +8,14 @@ r"""Utilities for building model-based closures."""
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from itertools import chain, repeat
-from typing import Any, Callable, Dict, Optional, Sequence, Tuple
+from types import NoneType
+from typing import Any, Callable, Optional
 
 from botorch.optim.closures.core import ForwardBackwardClosure
 from botorch.utils.dispatcher import Dispatcher, type_bypassing_encoder
-from botorch.utils.types import NoneType
 from gpytorch.mlls import (
     ExactMarginalLogLikelihood,
     MarginalLogLikelihood,
@@ -62,13 +64,13 @@ def get_loss_closure(
 
 def get_loss_closure_with_grads(
     mll: MarginalLogLikelihood,
-    parameters: Dict[str, Tensor],
+    parameters: dict[str, Tensor],
     data_loader: Optional[DataLoader] = None,
     backward: Callable[[Tensor], None] = Tensor.backward,
     reducer: Optional[Callable[[Tensor], Tensor]] = Tensor.sum,
     context_manager: Optional[Callable] = None,
     **kwargs: Any,
-) -> Callable[[], Tuple[Tensor, Tuple[Tensor, ...]]]:
+) -> Callable[[], tuple[Tensor, tuple[Tensor, ...]]]:
     r"""Public API for GetLossClosureWithGrads dispatcher.
 
     In most cases, this method simply adds a backward pass to a loss closure obtained by
@@ -104,10 +106,10 @@ def get_loss_closure_with_grads(
 @GetLossClosureWithGrads.register(object, object, object, object)
 def _get_loss_closure_with_grads_fallback(
     mll: MarginalLogLikelihood,
-    _: object,
-    __: object,
+    _likelihood_type: object,
+    _model_type: object,
     data_loader: Optional[DataLoader],
-    parameters: Dict[str, Tensor],
+    parameters: dict[str, Tensor],
     reducer: Callable[[Tensor], Tensor] = Tensor.sum,
     backward: Callable[[Tensor], None] = Tensor.backward,
     context_manager: Callable = None,  # pyre-ignore [9]
@@ -127,8 +129,8 @@ def _get_loss_closure_with_grads_fallback(
 @GetLossClosure.register(MarginalLogLikelihood, object, object, DataLoader)
 def _get_loss_closure_fallback_external(
     mll: MarginalLogLikelihood,
-    _: object,
-    __: object,
+    _likelihood_type: object,
+    _model_type: object,
     data_loader: DataLoader,
     **ignore: Any,
 ) -> Callable[[], Tensor]:
@@ -153,7 +155,7 @@ def _get_loss_closure_fallback_external(
 
 @GetLossClosure.register(MarginalLogLikelihood, object, object, NoneType)
 def _get_loss_closure_fallback_internal(
-    mll: MarginalLogLikelihood, _: object, __: object, ___: NoneType, **ignore: Any
+    mll: MarginalLogLikelihood, _: object, __: object, ___: None, **ignore: Any
 ) -> Callable[[], Tensor]:
     r"""Fallback loss closure with internally managed data."""
 
@@ -167,7 +169,7 @@ def _get_loss_closure_fallback_internal(
 
 @GetLossClosure.register(ExactMarginalLogLikelihood, object, object, NoneType)
 def _get_loss_closure_exact_internal(
-    mll: ExactMarginalLogLikelihood, _: object, __: object, ___: NoneType, **ignore: Any
+    mll: ExactMarginalLogLikelihood, _: object, __: object, ___: None, **ignore: Any
 ) -> Callable[[], Tensor]:
     r"""ExactMarginalLogLikelihood loss closure with internally managed data."""
 
@@ -183,7 +185,7 @@ def _get_loss_closure_exact_internal(
 
 @GetLossClosure.register(SumMarginalLogLikelihood, object, object, NoneType)
 def _get_loss_closure_sum_internal(
-    mll: SumMarginalLogLikelihood, _: object, __: object, ___: NoneType, **ignore: Any
+    mll: SumMarginalLogLikelihood, _: object, __: object, ___: None, **ignore: Any
 ) -> Callable[[], Tensor]:
     r"""SumMarginalLogLikelihood loss closure with internally managed data."""
 

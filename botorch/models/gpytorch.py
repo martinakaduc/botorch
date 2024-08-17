@@ -17,12 +17,20 @@ import itertools
 import warnings
 from abc import ABC
 from copy import deepcopy
-from typing import Any, List, Optional, Tuple, TYPE_CHECKING, Union
+from typing import Any, Optional, TYPE_CHECKING, Union
 
 import torch
 from botorch.acquisition.objective import PosteriorTransform
-from botorch.exceptions.errors import BotorchTensorDimensionError, InputDataError
-from botorch.exceptions.warnings import BotorchTensorDimensionWarning
+from botorch.exceptions.errors import (
+    BotorchTensorDimensionError,
+    InputDataError,
+    UnsupportedError,
+)
+from botorch.exceptions.warnings import (
+    _get_single_precision_warning,
+    BotorchTensorDimensionWarning,
+    InputDataWarning,
+)
 from botorch.models.model import Model, ModelList
 from botorch.models.utils import (
     _make_X_full,
@@ -31,11 +39,14 @@ from botorch.models.utils import (
     mod_batch_shape,
     multioutput_to_batch_mode_transform,
 )
-from botorch.posteriors.fully_bayesian import FullyBayesianPosterior
+from botorch.models.utils.assorted import fantasize as fantasize_flag
+from botorch.posteriors.fully_bayesian import GaussianMixturePosterior
 from botorch.posteriors.gpytorch import GPyTorchPosterior
-from botorch.utils.transforms import is_fully_bayesian
+from botorch.utils.multitask import separate_mtmvn
+from botorch.utils.transforms import is_ensemble
 from gpytorch.distributions import MultitaskMultivariateNormal, MultivariateNormal
 from gpytorch.likelihoods.gaussian_likelihood import FixedNoiseGaussianLikelihood
+from linear_operator.operators import BlockDiagLinearOperator, CatLinearOperator
 from torch import Tensor
 
 if TYPE_CHECKING:
@@ -44,24 +55,13 @@ if TYPE_CHECKING:
     from gpytorch.likelihoods import Likelihood  # pragma: no cover
 
 
-def _get_single_precision_warning(dtype: torch.dtype) -> str:
-    msg = (
-        f"The model inputs are of type {dtype}. It is strongly recommended "
-        "to use double precision in BoTorch, as this improves both "
-        "precision and stability and can help avoid numerical errors. "
-        "See https://github.com/pytorch/botorch/discussions/1444"
-    )
-    return msg
-
-
 class GPyTorchModel(Model, ABC):
     r"""Abstract base class for models based on GPyTorch models.
 
     The easiest way to use this is to subclass a model from a GPyTorch model
     class (e.g. an `ExactGP`) and this `GPyTorchModel`. See e.g. `SingleTaskGP`.
-
-    :meta private:
     """
+
     likelihood: Likelihood
 
     @staticmethod
@@ -108,6 +108,7 @@ class GPyTorchModel(Model, ABC):
                     "following error would have been raised with strict enforcement: "
                     f"{message}",
                     BotorchTensorDimensionWarning,
+                    stacklevel=2,
                 )
         # Yvar may not have the same batch dimensions, but the trailing dimensions
         # of Yvar should be the same as the trailing dimensions of Y.
@@ -125,8 +126,11 @@ class GPyTorchModel(Model, ABC):
                 f"{Yvar.dtype if Yvar is not None else None} for Yvar."
             )
         if X.dtype != torch.float64:
-            # NOTE: Not using a BotorchWarning since those get ignored.
-            warnings.warn(_get_single_precision_warning(X.dtype), UserWarning)
+            warnings.warn(
+                _get_single_precision_warning(str(X.dtype)),
+                InputDataWarning,
+                stacklevel=3,  # Warn at model constructor call.
+            )
 
     @property
     def batch_shape(self) -> torch.Size:
@@ -164,7 +168,9 @@ class GPyTorchModel(Model, ABC):
                 jointly.
             observation_noise: If True, add the observation noise from the
                 likelihood to the posterior. If a Tensor, use it directly as the
-                observation noise (must be of shape `(batch_shape) x q`).
+                observation noise (must be of shape `(batch_shape) x q`). It is
+                assumed to be in the outcome-transformed space if an outcome
+                transform is used.
             posterior_transform: An optional PosteriorTransform.
 
         Returns:
@@ -177,6 +183,9 @@ class GPyTorchModel(Model, ABC):
         # `model.forward()` at the training time
         X = self.transform_inputs(X)
         with gpt_posterior_settings():
+            # NOTE: BoTorch's GPyTorchModels also inherit from GPyTorch's ExactGP, thus
+            # self(X) calls GPyTorch's ExactGP's __call__, which computes the posterior,
+            # rather than e.g. SingleTaskGP's forward, which computes the prior.
             mvn = self(X)
             if observation_noise is not False:
                 if isinstance(observation_noise, torch.Tensor):
@@ -194,7 +203,9 @@ class GPyTorchModel(Model, ABC):
             return posterior_transform(posterior)
         return posterior
 
-    def condition_on_observations(self, X: Tensor, Y: Tensor, **kwargs: Any) -> Model:
+    def condition_on_observations(
+        self, X: Tensor, Y: Tensor, noise: Optional[Tensor] = None, **kwargs: Any
+    ) -> Model:
         r"""Condition the model on new observations.
 
         Args:
@@ -209,6 +220,9 @@ class GPyTorchModel(Model, ABC):
                 standard broadcasting semantics. If `Y` has fewer batch dimensions
                 than `X`, its is assumed that the missing batch dimensions are
                 the same for all `Y`.
+            noise: If not `None`, a tensor of the same shape as `Y` representing
+                the associated noise variance.
+            kwargs: Passed to `self.get_fantasy_model`.
 
         Returns:
             A `Model` object of the same type, representing the original model
@@ -223,21 +237,26 @@ class GPyTorchModel(Model, ABC):
             >>> new_Y = torch.sin(new_X[:, 0]) + torch.cos(new_X[:, 1])
             >>> model = model.condition_on_observations(X=new_X, Y=new_Y)
         """
-        Yvar = kwargs.get("noise", None)
+        Yvar = noise
+
         if hasattr(self, "outcome_transform"):
             # pass the transformed data to get_fantasy_model below
             # (unless we've already trasnformed if BatchedMultiOutputGPyTorchModel)
             if not isinstance(self, BatchedMultiOutputGPyTorchModel):
-                Y, Yvar = self.outcome_transform(Y, Yvar)
-        # validate using strict=False, since we cannot tell if Y has an explicit
-        # output dimension
-        self._validate_tensor_args(X=X, Y=Y, Yvar=Yvar, strict=False)
+                # `noise` is assumed to already be outcome-transformed.
+                Y, _ = self.outcome_transform(Y=Y, Yvar=Yvar)
+        # Validate using strict=False, since we cannot tell if Y has an explicit
+        # output dimension. Do not check shapes when fantasizing as they are
+        # not expected to match.
+        if fantasize_flag.off():
+            self._validate_tensor_args(X=X, Y=Y, Yvar=Yvar, strict=False)
         if Y.size(-1) == 1:
             Y = Y.squeeze(-1)
             if Yvar is not None:
                 kwargs.update({"noise": Yvar.squeeze(-1)})
         # get_fantasy_model will properly copy any existing outcome transforms
         # (since it deepcopies the original model)
+
         return self.get_fantasy_model(inputs=X, targets=Y, **kwargs)
 
 
@@ -248,8 +267,6 @@ class BatchedMultiOutputGPyTorchModel(GPyTorchModel):
 
     This model should be used when the same training data is used for all outputs.
     Outputs are modeled independently by using a different batch for each output.
-
-    :meta private:
     """
 
     _num_outputs: int
@@ -259,7 +276,7 @@ class BatchedMultiOutputGPyTorchModel(GPyTorchModel):
     @staticmethod
     def get_batch_dimensions(
         train_X: Tensor, train_Y: Tensor
-    ) -> Tuple[torch.Size, torch.Size]:
+    ) -> tuple[torch.Size, torch.Size]:
         r"""Get the raw batch shape and output-augmented batch shape of the inputs.
 
         Args:
@@ -309,7 +326,7 @@ class BatchedMultiOutputGPyTorchModel(GPyTorchModel):
 
     def _transform_tensor_args(
         self, X: Tensor, Y: Tensor, Yvar: Optional[Tensor] = None
-    ) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
+    ) -> tuple[Tensor, Tensor, Optional[Tensor]]:
         r"""Transforms tensor arguments: for single output models, the output
         dimension is squeezed and for multi-output models, the output dimension is
         transformed into the left-most batch dimension.
@@ -337,13 +354,60 @@ class BatchedMultiOutputGPyTorchModel(GPyTorchModel):
             )
         return X, Y.squeeze(-1), None if Yvar is None else Yvar.squeeze(-1)
 
+    def _apply_noise(
+        self,
+        X: Tensor,
+        mvn: MultivariateNormal,
+        observation_noise: Union[bool, Tensor] = False,
+    ) -> MultivariateNormal:
+        """Adds the observation noise to the posterior.
+
+        Args:
+            X: A tensor of shape `batch_shape x q x d`.
+            mvn: A `MultivariateNormal` object representing the posterior over the true
+                latent function.
+            num_outputs: The number of outputs of the model.
+            observation_noise: If True, add the observation noise from the
+                likelihood to the posterior. If a Tensor, use it directly as the
+                observation noise (must be of shape `(batch_shape) x q x m`).
+
+        Returns:
+            The posterior predictive.
+        """
+        if observation_noise is False:
+            return mvn
+        # noise_shape is `broadcast(test_batch_shape, model.batch_shape) x m x q`
+        noise_shape = mvn.batch_shape + mvn.event_shape
+        if torch.is_tensor(observation_noise):
+            # TODO: Validate noise shape
+            # make observation_noise's shape match noise_shape
+            if self.num_outputs > 1:
+                obs_noise = observation_noise.transpose(-1, -2)
+            else:
+                obs_noise = observation_noise.squeeze(-1)
+            mvn = self.likelihood(
+                mvn,
+                X,
+                noise=obs_noise.expand(noise_shape),
+            )
+        elif isinstance(self.likelihood, FixedNoiseGaussianLikelihood):
+            # Use the mean of the previous noise values (TODO: be smarter here).
+            observation_noise = self.likelihood.noise.mean(dim=-1, keepdim=True)
+            mvn = self.likelihood(
+                mvn,
+                X,
+                noise=observation_noise.expand(noise_shape),
+            )
+        else:
+            mvn = self.likelihood(mvn, X)
+        return mvn
+
     def posterior(
         self,
         X: Tensor,
-        output_indices: Optional[List[int]] = None,
+        output_indices: Optional[list[int]] = None,
         observation_noise: Union[bool, Tensor] = False,
         posterior_transform: Optional[PosteriorTransform] = None,
-        **kwargs: Any,
     ) -> Union[GPyTorchPosterior, TransformedPosterior]:
         r"""Computes the posterior over model outputs at the provided points.
 
@@ -376,22 +440,11 @@ class BatchedMultiOutputGPyTorchModel(GPyTorchModel):
                 X, output_dim_idx = add_output_dim(
                     X=X, original_batch_shape=self._input_batch_shape
                 )
+            # NOTE: BoTorch's GPyTorchModels also inherit from GPyTorch's ExactGP, thus
+            # self(X) calls GPyTorch's ExactGP's __call__, which computes the posterior,
+            # rather than e.g. SingleTaskGP's forward, which computes the prior.
             mvn = self(X)
-            if observation_noise is not False:
-                if torch.is_tensor(observation_noise):
-                    # TODO: Validate noise shape
-                    # make observation_noise `batch_shape x q x n`
-                    if self.num_outputs > 1:
-                        obs_noise = observation_noise.transpose(-1, -2)
-                    else:
-                        obs_noise = observation_noise.squeeze(-1)
-                    mvn = self.likelihood(mvn, X, noise=obs_noise)
-                elif isinstance(self.likelihood, FixedNoiseGaussianLikelihood):
-                    # Use the mean of the previous noise values (TODO: be smarter here).
-                    noise = self.likelihood.noise.mean().expand(X.shape[:-1])
-                    mvn = self.likelihood(mvn, X, noise=noise)
-                else:
-                    mvn = self.likelihood(mvn, X)
+            mvn = self._apply_noise(X=X, mvn=mvn, observation_noise=observation_noise)
             if self._num_outputs > 1:
                 mean_x = mvn.mean
                 covar_x = mvn.lazy_covariance_matrix
@@ -448,9 +501,12 @@ class BatchedMultiOutputGPyTorchModel(GPyTorchModel):
         """
         noise = kwargs.get("noise")
         if hasattr(self, "outcome_transform"):
-            # we need to apply transforms before shifting batch indices around
-            Y, noise = self.outcome_transform(Y, noise)
-        self._validate_tensor_args(X=X, Y=Y, Yvar=noise, strict=False)
+            # We need to apply transforms before shifting batch indices around.
+            # `noise` is assumed to already be outcome-transformed.
+            Y, _ = self.outcome_transform(Y)
+        # Do not check shapes when fantasizing as they are not expected to match.
+        if fantasize_flag.off():
+            self._validate_tensor_args(X=X, Y=Y, Yvar=noise, strict=False)
         inputs = X
         if self._num_outputs > 1:
             inputs, targets, noise = multioutput_to_batch_mode_transform(
@@ -470,10 +526,11 @@ class BatchedMultiOutputGPyTorchModel(GPyTorchModel):
         fantasy_model._input_batch_shape = fantasy_model.train_targets.shape[
             : (-1 if self._num_outputs == 1 else -2)
         ]
-        fantasy_model._aug_batch_shape = fantasy_model.train_targets.shape[:-1]
+        if not self._is_fully_bayesian:
+            fantasy_model._aug_batch_shape = fantasy_model.train_targets.shape[:-1]
         return fantasy_model
 
-    def subset_output(self, idcs: List[int]) -> BatchedMultiOutputGPyTorchModel:
+    def subset_output(self, idcs: list[int]) -> BatchedMultiOutputGPyTorchModel:
         r"""Subset the model along the output dimension.
 
         Args:
@@ -527,6 +584,12 @@ class BatchedMultiOutputGPyTorchModel(GPyTorchModel):
         except AttributeError:
             pass
 
+        # Subset fixed noise likelihood if present.
+        if isinstance(self.likelihood, FixedNoiseGaussianLikelihood):
+            full_noise = new_model.likelihood.noise_covar.noise
+            new_noise = full_noise[..., idcs if len(idcs) > 1 else idcs[0], :]
+            new_model.likelihood.noise_covar.noise = new_noise
+
         return new_model
 
 
@@ -534,9 +597,8 @@ class ModelListGPyTorchModel(ModelList, GPyTorchModel, ABC):
     r"""Abstract base class for models based on multi-output GPyTorch models.
 
     This is meant to be used with a gpytorch ModelList wrapper for independent
-    evaluation of submodels.
-
-    :meta private:
+    evaluation of submodels. Those submodels can themselves be multi-output
+    models, in which case the task covariances will be ignored.
     """
 
     @property
@@ -557,7 +619,7 @@ class ModelListGPyTorchModel(ModelList, GPyTorchModel, ABC):
             )
             try:
                 broadcast_shape = torch.broadcast_shapes(*batch_shapes)
-                warnings.warn(msg + ". Broadcasting batch shapes.")
+                warnings.warn(msg + ". Broadcasting batch shapes.", stacklevel=2)
                 return broadcast_shape
             except RuntimeError:
                 raise NotImplementedError(msg + " that are not broadcastble.")
@@ -567,12 +629,14 @@ class ModelListGPyTorchModel(ModelList, GPyTorchModel, ABC):
     def posterior(
         self,
         X: Tensor,
-        output_indices: Optional[List[int]] = None,
+        output_indices: Optional[list[int]] = None,
         observation_noise: Union[bool, Tensor] = False,
         posterior_transform: Optional[PosteriorTransform] = None,
-        **kwargs: Any,
     ) -> Union[GPyTorchPosterior, PosteriorList]:
         r"""Computes the posterior over model outputs at the provided points.
+        If any model returns a MultitaskMultivariateNormal posterior, then that
+        will be split into individual MVNs per task, with inter-task covariance
+        ignored.
 
         Args:
             X: A `b x q x d`-dim Tensor, where `d` is the dimension of the
@@ -594,7 +658,7 @@ class ModelListGPyTorchModel(ModelList, GPyTorchModel, ABC):
             - If no `posterior_transform` is provided and the component models have no
                 `outcome_transform`, or if the component models only use linear outcome
                 transforms like `Standardize` (i.e. not `Log`), returns a
-                `GPyTorchPosterior` or `FullyBayesianPosterior` object,
+                `GPyTorchPosterior` or `GaussianMixturePosterior` object,
                 representing `batch_shape` joint distributions over `q` points
                 and the outputs selected by `output_indices` each. Includes
                 measurement noise if `observation_noise` is specified.
@@ -619,24 +683,44 @@ class ModelListGPyTorchModel(ModelList, GPyTorchModel, ABC):
             X=X,
             output_indices=output_indices,
             observation_noise=observation_noise,
-            **kwargs,
         )
         if not returns_untransformed:
             mvns = [p.distribution for p in posterior.posteriors]
-            # Combining MTMVNs into a single MTMVN is currently not supported.
-            if not any(isinstance(m, MultitaskMultivariateNormal) for m in mvns):
-                # Return the result as a GPyTorchPosterior/FullyBayesianPosterior.
+            if any(isinstance(m, MultitaskMultivariateNormal) for m in mvns):
+                mvn_list = []
+                for mvn in mvns:
+                    if len(mvn.event_shape) == 2:
+                        # We separate MTMVNs into independent-across-task MVNs for
+                        # the convenience of using BlockDiagLinearOperator below.
+                        # (b x q x m x m) -> list of m (b x q x 1 x 1)
+                        mvn_list.extend(separate_mtmvn(mvn))
+                    else:
+                        mvn_list.append(mvn)
+                mean = torch.stack([mvn.mean for mvn in mvn_list], dim=-1)
+                covars = CatLinearOperator(
+                    *[mvn.lazy_covariance_matrix.unsqueeze(-3) for mvn in mvn_list],
+                    dim=-3,
+                )  # List of m (b x q x 1 x 1) -> (b x q x m x 1 x 1)
+                mvn = MultitaskMultivariateNormal(
+                    mean=mean,
+                    covariance_matrix=BlockDiagLinearOperator(covars, block_dim=-3).to(
+                        X
+                    ),  # (b x q x m x 1 x 1) -> (b x q x m x m)
+                    interleaved=False,
+                )
+            else:
                 mvn = (
                     mvns[0]
                     if len(mvns) == 1
                     else MultitaskMultivariateNormal.from_independent_mvns(mvns=mvns)
                 )
-                if any(is_fully_bayesian(m) for m in self.models):
-                    # Mixing fully Bayesian and other GP models is currently
-                    # not supported.
-                    posterior = FullyBayesianPosterior(distribution=mvn)
-                else:
-                    posterior = GPyTorchPosterior(distribution=mvn)
+            # Return the result as a GPyTorchPosterior/GaussianMixturePosterior.
+            if any(is_ensemble(m) for m in self.models):
+                # Mixing fully Bayesian and other GP models is currently
+                # not supported.
+                posterior = GaussianMixturePosterior(distribution=mvn)
+            else:
+                posterior = GPyTorchPosterior(distribution=mvn)
         if posterior_transform is not None:
             return posterior_transform(posterior)
         return posterior
@@ -650,17 +734,109 @@ class MultiTaskGPyTorchModel(GPyTorchModel, ABC):
 
     This class provides the `posterior` method to models that implement a
     "long-format" multi-task GP in the style of `MultiTaskGP`.
-
-    :meta private:
     """
+
+    def _map_tasks(self, task_values: Tensor) -> Tensor:
+        """Map raw task values to the task indices used by the model.
+
+        Args:
+            task_values: A tensor of task values.
+
+        Returns:
+            A tensor of task indices with the same shape as the input
+                tensor.
+        """
+        if self._task_mapper is None:
+            if not (
+                torch.all(0 <= task_values) and torch.all(task_values < self.num_tasks)
+            ):
+                raise ValueError(
+                    "Expected all task features in `X` to be between 0 and "
+                    f"self.num_tasks - 1. Got {task_values}."
+                )
+        else:
+            task_values = task_values.long()
+
+            unexpected_task_values = set(task_values.unique().tolist()).difference(
+                self._expected_task_values
+            )
+            if len(unexpected_task_values) > 0:
+                raise ValueError(
+                    "Received invalid raw task values. Expected raw value to be in"
+                    f" {self._expected_task_values}, but got unexpected task values:"
+                    f" {unexpected_task_values}."
+                )
+            task_values = self._task_mapper[task_values]
+        return task_values
+
+    def _apply_noise(
+        self,
+        X: Tensor,
+        mvn: MultivariateNormal,
+        num_outputs: int,
+        observation_noise: Union[bool, Tensor],
+    ) -> MultivariateNormal:
+        """Adds the observation noise to the posterior.
+
+        If the likelihood is a `FixedNoiseGaussianLikelihood`, then
+        the average noise per task is computed, and a diagonal noise
+        matrix is added to the posterior covariance matrix, where
+        the noise per input is the average noise for its respective
+        task. If the likelihood is a Gaussian likelihood, then
+        currently there is a shared inferred noise level for all
+        tasks.
+
+        TODO: implement support for task-specific inferred noise levels.
+
+        Args:
+            X: A tensor of shape `batch_shape x q x d + 1`,
+                where `d` is the dimension of the feature space and the `+ 1`
+                dimension is the task feature / index.
+            mvn: A `MultivariateNormal` object representing the posterior over the true
+                latent function.
+            num_outputs: The number of outputs of the model.
+            observation_noise: If True, add observation noise from the respective
+                likelihood. Tensor input is currently not supported.
+
+        Returns:
+            The posterior predictive.
+        """
+        if torch.is_tensor(observation_noise):
+            raise NotImplementedError(
+                "Passing a tensor of observations is not supported by MultiTaskGP."
+            )
+        elif observation_noise is False:
+            return mvn
+        elif isinstance(self.likelihood, FixedNoiseGaussianLikelihood):
+            # get task features for test points
+            test_task_features = X[..., self._task_feature]
+            test_task_features = self._map_tasks(test_task_features).long()
+            unique_test_task_features = test_task_features.unique()
+            # get task features for training points
+            train_task_features = self.train_inputs[0][..., self._task_feature]
+            train_task_features = self._map_tasks(train_task_features).long()
+            noise_by_task = torch.zeros(self.num_tasks, dtype=X.dtype, device=X.device)
+            for task_feature in unique_test_task_features:
+                mask = train_task_features == task_feature
+                noise_by_task[task_feature] = self.likelihood.noise[mask].mean(
+                    dim=-1, keepdim=True
+                )
+            # noise_shape is `broadcast(test_batch_shape, model.batch_shape) x q`
+            noise_shape = X.shape[:-1]
+            observation_noise = noise_by_task[test_task_features].expand(noise_shape)
+            return self.likelihood(
+                mvn,
+                X,
+                noise=observation_noise,
+            )
+        return self.likelihood(mvn, X)
 
     def posterior(
         self,
         X: Tensor,
-        output_indices: Optional[List[int]] = None,
+        output_indices: Optional[list[int]] = None,
         observation_noise: Union[bool, Tensor] = False,
         posterior_transform: Optional[PosteriorTransform] = None,
-        **kwargs: Any,
     ) -> Union[GPyTorchPosterior, TransformedPosterior]:
         r"""Computes the posterior over model outputs at the provided points.
 
@@ -673,9 +849,9 @@ class MultiTaskGPyTorchModel(GPyTorchModel, ABC):
                 model produces outputs for tasks in in `self._output_tasks` (specified
                 as `output_tasks` while constructing the model), which can overwritten
                 using `output_indices`.
-            output_indices: A list of indices, corresponding to the tasks over
-                which to compute the posterior. Only used if `X` does not include the
-                task feature. If omitted, defaults to `self._output_tasks`.
+            output_indices: A list of task values over which to compute the posterior.
+                Only used if `X` does not include the task feature. If omitted,
+                defaults to `self._output_tasks`.
             observation_noise: If True, add observation noise from the respective
                 likelihoods. If a Tensor, specifies the observation noise levels
                 to add.
@@ -690,46 +866,38 @@ class MultiTaskGPyTorchModel(GPyTorchModel, ABC):
         """
         includes_task_feature = X.shape[-1] == self.num_non_task_features + 1
         if includes_task_feature:
-            # Make sure all task feature values are valid.
-            task_features = X[..., self._task_feature].unique()
-            if not (
-                (task_features >= 0).all() and (task_features < self.num_tasks).all()
-            ):
-                raise ValueError(
-                    "Expected all task features in `X` to be between 0 and "
-                    f"self.num_tasks - 1. Got {task_features}."
-                )
             if output_indices is not None:
                 raise ValueError(
                     "`output_indices` must be None when `X` includes task features."
                 )
+            task_features = X[..., self._task_feature].unique()
             num_outputs = 1
             X_full = X
         else:
             # Add the task features to construct the full X for evaluation.
-            if output_indices is None:
-                output_indices = self._output_tasks
-            num_outputs = len(output_indices)
-            if not all(0 <= i < self.num_tasks for i in output_indices):
-                raise ValueError(
-                    "Expected `output_indices` to be between 0 and self.num_tasks - 1. "
-                    f"Got {output_indices}."
-                )
-            X_full = _make_X_full(
-                X=X, output_indices=output_indices, tf=self._task_feature
+            task_features = torch.tensor(
+                self._output_tasks if output_indices is None else output_indices,
+                dtype=torch.long,
+                device=X.device,
             )
-
+            num_outputs = len(task_features)
+            X_full = _make_X_full(
+                X=X, output_indices=task_features.tolist(), tf=self._task_feature
+            )
+        # Make sure all task feature values are valid.
+        task_features = self._map_tasks(task_values=task_features)
         self.eval()  # make sure model is in eval mode
         # input transforms are applied at `posterior` in `eval` mode, and at
         # `model.forward()` at the training time
         X_full = self.transform_inputs(X_full)
         with gpt_posterior_settings():
             mvn = self(X_full)
-            if observation_noise is not False:
-                raise NotImplementedError(
-                    "Specifying observation noise is not yet supported by "
-                    f"{self.__class__.__name__}."
-                )
+            mvn = self._apply_noise(
+                X=X_full,
+                mvn=mvn,
+                num_outputs=num_outputs,
+                observation_noise=observation_noise,
+            )
         # If single-output, return the posterior of a single-output model
         if num_outputs == 1:
             posterior = GPyTorchPosterior(distribution=mvn)
@@ -748,3 +916,16 @@ class MultiTaskGPyTorchModel(GPyTorchModel, ABC):
         if posterior_transform is not None:
             return posterior_transform(posterior)
         return posterior
+
+    def subset_output(self, idcs: list[int]) -> MultiTaskGPyTorchModel:
+        r"""Returns a new model that only outputs a subset of the outputs.
+
+        Args:
+            idcs: A list of output indices, corresponding to the outputs to keep.
+
+        Returns:
+            A new model that only outputs the requested outputs.
+        """
+        raise UnsupportedError(
+            "Subsetting outputs is not supported by `MultiTaskGPyTorchModel`."
+        )

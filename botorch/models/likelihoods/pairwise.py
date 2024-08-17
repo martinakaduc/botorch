@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import math
 from abc import ABC, abstractmethod
-from typing import Any, Tuple
 
 import torch
 from botorch.utils.probability.utils import (
@@ -28,8 +27,6 @@ from torch.distributions import Bernoulli
 class PairwiseLikelihood(Likelihood, ABC):
     """
     Pairwise likelihood base class for pairwise preference GP (e.g., PairwiseGP).
-
-    :meta private:
     """
 
     def __init__(self, max_plate_nesting: int = 1):
@@ -41,7 +38,7 @@ class PairwiseLikelihood(Likelihood, ABC):
         """
         super().__init__(max_plate_nesting)
 
-    def forward(self, utility: Tensor, D: Tensor, **kwargs: Any) -> Bernoulli:
+    def forward(self, utility: Tensor, D: Tensor) -> Bernoulli:
         """Given the difference in (estimated) utility util_diff = f(v) - f(u),
         return a Bernoulli distribution object representing the likelihood of
         the user prefer v over u.
@@ -123,7 +120,7 @@ class PairwiseProbitLikelihood(PairwiseLikelihood):
         z = z.clamp(-self._zlim, self._zlim).squeeze(-1)
         return z
 
-    def _calc_z_derived(self, z: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+    def _calc_z_derived(self, z: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         """Calculate auxiliary statistics derived from z, including log pdf,
         log cdf, and the hazard function (pdf divided by cdf)
 

@@ -6,7 +6,7 @@
 
 
 import itertools
-from typing import List, Optional
+from typing import Optional
 
 import torch
 from botorch import fit_fully_bayesian_model_nuts
@@ -36,19 +36,18 @@ from botorch.models.fully_bayesian_multitask import (
 )
 from botorch.models.transforms.input import Normalize
 from botorch.models.transforms.outcome import Standardize
-from botorch.posteriors import FullyBayesianPosterior
+from botorch.posteriors import GaussianMixturePosterior
 from botorch.sampling.get_sampler import get_sampler
 from botorch.sampling.normal import IIDNormalSampler
 from botorch.utils.multi_objective.box_decompositions.non_dominated import (
     NondominatedPartitioning,
 )
+from botorch.utils.test_helpers import gen_multi_task_dataset
 from botorch.utils.testing import BotorchTestCase
 from gpytorch.kernels import MaternKernel, ScaleKernel
 from gpytorch.likelihoods import FixedNoiseGaussianLikelihood
 from gpytorch.likelihoods.gaussian_likelihood import GaussianLikelihood
 from gpytorch.means import ConstantMean
-
-from .test_multitask import _gen_datasets
 
 EXPECTED_KEYS = [
     "latent_features",
@@ -73,8 +72,8 @@ EXPECTED_KEYS_NOISE = EXPECTED_KEYS + [
 class TestFullyBayesianMultiTaskGP(BotorchTestCase):
     def _get_data_and_model(
         self,
-        task_rank: Optional[int] = 1,
-        output_tasks: Optional[List[int]] = None,
+        task_rank: Optional[int] = None,
+        output_tasks: Optional[list[int]] = None,
         infer_noise: bool = False,
         **tkwargs
     ):
@@ -167,6 +166,15 @@ class TestFullyBayesianMultiTaskGP(BotorchTestCase):
                 task_feature=4,
             )
         train_X, train_Y, train_Yvar, model = self._get_data_and_model(**tkwargs)
+        with self.assertRaisesRegex(
+            NotImplementedError, "`all_tasks` argument is not supported"
+        ):
+            SaasFullyBayesianMultiTaskGP(
+                train_X=train_X,
+                train_Y=train_Y,
+                task_feature=-1,
+                all_tasks=[0, 1, 2, 3],
+            )
         sampler = IIDNormalSampler(sample_shape=torch.Size([2]))
         with self.assertRaisesRegex(
             NotImplementedError, "Fantasize is not implemented!"
@@ -252,12 +260,12 @@ class TestFullyBayesianMultiTaskGP(BotorchTestCase):
         for batch_shape in [[5], [5, 2], [5, 2, 6]]:
             test_X = torch.rand(*batch_shape, d, **tkwargs)
             posterior = model.posterior(test_X)
-            self.assertIsInstance(posterior, FullyBayesianPosterior)
-            self.assertIsInstance(posterior, FullyBayesianPosterior)
+            self.assertIsInstance(posterior, GaussianMixturePosterior)
+            self.assertIsInstance(posterior, GaussianMixturePosterior)
 
             test_X = torch.rand(*batch_shape, d, **tkwargs)
             posterior = model.posterior(test_X)
-            self.assertIsInstance(posterior, FullyBayesianPosterior)
+            self.assertIsInstance(posterior, GaussianMixturePosterior)
             # Mean/variance
             expected_shape = (
                 *batch_shape[: MCMC_DIM + 2],
@@ -367,7 +375,7 @@ class TestFullyBayesianMultiTaskGP(BotorchTestCase):
         self.test_fit_model(dtype=torch.float)
 
     def test_fit_model_infer_noise(self):
-        self.test_fit_model(infer_noise=True, task_rank=4)
+        self.test_fit_model(infer_noise=True, task_rank=2)
 
     def test_transforms(self, infer_noise: bool = False):
         tkwargs = {"device": self.device, "dtype": torch.double}
@@ -566,14 +574,9 @@ class TestFullyBayesianMultiTaskGP(BotorchTestCase):
         for dtype, infer_noise in [(torch.float, False), (torch.double, True)]:
             tkwargs = {"device": self.device, "dtype": dtype}
             task_feature = 0
-
-            if infer_noise:
-                datasets, (train_X, train_Y) = _gen_datasets(yvar=None, **tkwargs)
-                train_Yvar = None
-            else:
-                datasets, (train_X, train_Y, train_Yvar) = _gen_datasets(
-                    yvar=0.05, **tkwargs
-                )
+            datasets, (train_X, train_Y, train_Yvar) = gen_multi_task_dataset(
+                yvar=None if infer_noise else 0.05, **tkwargs
+            )
 
             model = SaasFullyBayesianMultiTaskGP(
                 train_X=train_X,
@@ -589,7 +592,10 @@ class TestFullyBayesianMultiTaskGP(BotorchTestCase):
             )
             self.assertTrue(torch.equal(data_dict["train_X"], train_X))
             self.assertTrue(torch.equal(data_dict["train_Y"], train_Y))
-            self.assertAllClose(data_dict["train_Yvar"], train_Yvar)
+            if train_Yvar is not None:
+                self.assertAllClose(data_dict["train_Yvar"], train_Yvar)
+            else:
+                self.assertNotIn("train_Yvar", data_dict)
             self.assertEqual(data_dict["task_feature"], task_feature)
             self.assertEqual(data_dict["rank"], 1)
             self.assertTrue("task_covar_prior" not in data_dict)

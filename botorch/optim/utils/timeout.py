@@ -7,7 +7,9 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Callable, Dict, Optional, Sequence, Tuple, Union
+import warnings
+from collections.abc import Sequence
+from typing import Any, Callable, Optional, Union
 
 import numpy as np
 from botorch.exceptions.errors import OptimizationTimeoutError
@@ -15,18 +17,18 @@ from scipy import optimize
 
 
 def minimize_with_timeout(
-    fun: Callable[[np.ndarray, *Any], float],
+    fun: Callable[[np.ndarray, ...], float],
     x0: np.ndarray,
-    args: Tuple[Any, ...] = (),
+    args: tuple[Any, ...] = (),
     method: Optional[str] = None,
     jac: Optional[Union[str, Callable, bool]] = None,
     hess: Optional[Union[str, Callable, optimize.HessianUpdateStrategy]] = None,
     hessp: Optional[Callable] = None,
-    bounds: Optional[Union[Sequence[Tuple[float, float]], optimize.Bounds]] = None,
+    bounds: Optional[Union[Sequence[tuple[float, float]], optimize.Bounds]] = None,
     constraints=(),  # Typing this properly is a s**t job
     tol: Optional[float] = None,
     callback: Optional[Callable] = None,
-    options: Optional[Dict[str, Any]] = None,
+    options: Optional[dict[str, Any]] = None,
     timeout_sec: Optional[float] = None,
 ) -> optimize.OptimizeResult:
     r"""Wrapper around scipy.optimize.minimize to support timeout.
@@ -39,7 +41,7 @@ def minimize_with_timeout(
     method that is injected to the scipy.optimize.minimize call and that keeps
     track of the runtime and the optimization variables at the current iteration.
     """
-    if timeout_sec:
+    if timeout_sec is not None:
 
         start_time = time.monotonic()
         callback_data = {"num_iterations": 0}  # update from withing callback below
@@ -77,6 +79,7 @@ def minimize_with_timeout(
         wrapped_callback = callback
 
     try:
+        warnings.filterwarnings("error", message="Method .* cannot handle")
         return optimize.minimize(
             fun=fun,
             x0=x0,

@@ -16,16 +16,22 @@ from __future__ import annotations
 
 import warnings
 from math import ceil
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Callable, Optional, Union
 
 import torch
 from botorch import settings
+from botorch.acquisition import analytic, monte_carlo, multi_objective
 from botorch.acquisition.acquisition import AcquisitionFunction
+from botorch.acquisition.fixed_feature import FixedFeatureAcquisitionFunction
 from botorch.acquisition.knowledge_gradient import (
     _get_value_function,
     qKnowledgeGradient,
 )
-from botorch.acquisition.utils import is_nonnegative
+from botorch.acquisition.multi_objective.hypervolume_knowledge_gradient import (
+    _get_hv_value_function,
+    qHypervolumeKnowledgeGradient,
+    qMultiFidelityHypervolumeKnowledgeGradient,
+)
 from botorch.exceptions.errors import BotorchTensorDimensionError, UnsupportedError
 from botorch.exceptions.warnings import (
     BadInitialCandidatesWarning,
@@ -54,18 +60,18 @@ TGenInitialConditions = Callable[
         int,
         int,
         int,
-        Optional[Dict[int, float]],
-        Optional[Dict[str, Union[bool, float, int]]],
-        Optional[List[Tuple[Tensor, Tensor, float]]],
-        Optional[List[Tuple[Tensor, Tensor, float]]],
+        Optional[dict[int, float]],
+        Optional[dict[str, Union[bool, float, int]]],
+        Optional[list[tuple[Tensor, Tensor, float]]],
+        Optional[list[tuple[Tensor, Tensor, float]]],
     ],
     Optional[Tensor],
 ]
 
 
 def transform_constraints(
-    constraints: Union[List[Tuple[Tensor, Tensor, float]], None], q: int, d: int
-) -> List[Tuple[Tensor, Tensor, float]]:
+    constraints: Union[list[tuple[Tensor, Tensor, float]], None], q: int, d: int
+) -> list[tuple[Tensor, Tensor, float]]:
     r"""Transform constraints to sample from a d*q-dimensional space instead of a
     d-dimensional state.
 
@@ -97,8 +103,8 @@ def transform_constraints(
 
 
 def transform_intra_point_constraint(
-    constraint: Tuple[Tensor, Tensor, float], d: int, q: int
-) -> List[Tuple[Tensor, Tensor, float]]:
+    constraint: tuple[Tensor, Tensor, float], d: int, q: int
+) -> list[tuple[Tensor, Tensor, float]]:
     r"""Transforms an intra-point/pointwise constraint from
     d-dimensional space to a d*q-dimesional space.
 
@@ -135,8 +141,8 @@ def transform_intra_point_constraint(
 
 
 def transform_inter_point_constraint(
-    constraint: Tuple[Tensor, Tensor, float], d: int
-) -> Tuple[Tensor, Tensor, float]:
+    constraint: tuple[Tensor, Tensor, float], d: int
+) -> tuple[Tensor, Tensor, float]:
     r"""Transforms an inter-point constraint from
     d-dimensional space to a d*q dimesional space.
 
@@ -174,10 +180,10 @@ def sample_q_batches_from_polytope(
     q: int,
     bounds: Tensor,
     n_burnin: int,
-    thinning: int,
+    n_thinning: int,
     seed: int,
-    inequality_constraints: Optional[List[Tuple[Tensor, Tensor, float]]] = None,
-    equality_constraints: Optional[List[Tuple[Tensor, Tensor, float]]] = None,
+    inequality_constraints: Optional[list[tuple[Tensor, Tensor, float]]] = None,
+    equality_constraints: Optional[list[tuple[Tensor, Tensor, float]]] = None,
 ) -> Tensor:
     r"""Samples `n` q-baches from a polytope of dimension `d`.
 
@@ -186,8 +192,8 @@ def sample_q_batches_from_polytope(
         q: Number of samples per q-batch
         bounds: A `2 x d` tensor of lower and upper bounds for each column of `X`.
         n_burnin: The number of burn-in samples for the Markov chain sampler.
-            thinning: The amount of thinning (number of steps to take between
-            returning samples).
+        n_thinning: The amount of thinning. The sampler will return every
+            `n_thinning` sample (after burn-in).
         seed: The random seed.
         inequality_constraints: A list of tuples (indices, coefficients, rhs),
             with each tuple encoding an inequality constraint of the form
@@ -219,7 +225,7 @@ def sample_q_batches_from_polytope(
             ),
             seed=seed,
             n_burnin=n_burnin,
-            thinning=thinning * q,
+            n_thinning=n_thinning * q,
         )
     else:
         samples = get_polytope_samples(
@@ -229,7 +235,7 @@ def sample_q_batches_from_polytope(
             equality_constraints=equality_constraints,
             seed=seed,
             n_burnin=n_burnin,
-            thinning=thinning,
+            n_thinning=n_thinning,
         )
     return samples.view(n, q, -1).cpu()
 
@@ -240,11 +246,12 @@ def gen_batch_initial_conditions(
     q: int,
     num_restarts: int,
     raw_samples: int,
-    fixed_features: Optional[Dict[int, float]] = None,
-    options: Optional[Dict[str, Union[bool, float, int]]] = None,
-    inequality_constraints: Optional[List[Tuple[Tensor, Tensor, float]]] = None,
-    equality_constraints: Optional[List[Tuple[Tensor, Tensor, float]]] = None,
-    generator: Optional[Callable[[int, int, int], Tensor]] = None,
+    fixed_features: Optional[dict[int, float]] = None,
+    options: Optional[dict[str, Union[bool, float, int]]] = None,
+    inequality_constraints: Optional[list[tuple[Tensor, Tensor, float]]] = None,
+    equality_constraints: Optional[list[tuple[Tensor, Tensor, float]]] = None,
+    generator: Optional[Callable[[int, int, Optional[int]], Tensor]] = None,
+    fixed_X_fantasies: Optional[Tensor] = None,
 ) -> Tensor:
     r"""Generate a batch of initial conditions for random-restart optimziation.
 
@@ -276,8 +283,13 @@ def gen_batch_initial_conditions(
             with each tuple encoding an inequality constraint of the form
             `\sum_i (X[indices[i]] * coefficients[i]) = rhs`.
         generator: Callable for generating samples that are then further
-            processed. It receives `n`, `q` and `seed` as arguments and
-            returns a tensor of shape `n x q x d`.
+            processed. It receives `n`, `q` and `seed` as arguments
+            and returns a tensor of shape `n x q x d`.
+        fixed_X_fantasies: A fixed set of fantasy points to concatenate to
+            the `q` candidates being initialized along the `-2` dimension. The
+            shape should be `num_pseudo_points x d`. E.g., this should be
+            `num_fantasies x d` for KG and `num_fantasies*num_pareto x d`
+            for HVKG.
 
     Returns:
         A `num_restarts x q x d` tensor of initial conditions.
@@ -331,6 +343,7 @@ def gen_batch_initial_conditions(
             f"Sample dimension q*d={effective_dim} exceeding Sobol max dimension "
             f"({SobolEngine.MAXDIM}). Using iid samples instead.",
             SamplingWarning,
+            stacklevel=3,
         )
 
     while factor < max_factor:
@@ -338,7 +351,8 @@ def gen_batch_initial_conditions(
             n = raw_samples * factor
             if generator is not None:
                 X_rnd = generator(n, q, seed)
-            elif inequality_constraints is None and equality_constraints is None:
+            # check if no constraints are provided
+            elif not (inequality_constraints or equality_constraints):
                 if effective_dim <= SobolEngine.MAXDIM:
                     X_rnd = draw_sobol_samples(bounds=bounds_cpu, n=n, q=q, seed=seed)
                 else:
@@ -354,7 +368,7 @@ def gen_batch_initial_conditions(
                     q=q,
                     bounds=bounds,
                     n_burnin=options.get("n_burnin", 10000),
-                    thinning=options.get("thinning", 32),
+                    n_thinning=options.get("n_thinning", 32),
                     seed=seed,
                     equality_constraints=equality_constraints,
                     inequality_constraints=inequality_constraints,
@@ -378,6 +392,22 @@ def gen_batch_initial_conditions(
                         dim=0,
                     )
             X_rnd = fix_features(X_rnd, fixed_features=fixed_features)
+            if fixed_X_fantasies is not None:
+                if (d_f := fixed_X_fantasies.shape[-1]) != (d_r := X_rnd.shape[-1]):
+                    raise BotorchTensorDimensionError(
+                        "`fixed_X_fantasies` and `bounds` must both have the same "
+                        f"trailing dimension `d`, but have {d_f} and {d_r}, "
+                        "respectively."
+                    )
+                X_rnd = torch.cat(
+                    [
+                        X_rnd,
+                        fixed_X_fantasies.cpu()
+                        .unsqueeze(0)
+                        .expand(X_rnd.shape[0], *fixed_X_fantasies.shape),
+                    ],
+                    dim=-2,
+                )
             with torch.no_grad():
                 if batch_limit is None:
                     batch_limit = X_rnd.shape[0]
@@ -414,17 +444,17 @@ def gen_one_shot_kg_initial_conditions(
     q: int,
     num_restarts: int,
     raw_samples: int,
-    fixed_features: Optional[Dict[int, float]] = None,
-    options: Optional[Dict[str, Union[bool, float, int]]] = None,
-    inequality_constraints: Optional[List[Tuple[Tensor, Tensor, float]]] = None,
-    equality_constraints: Optional[List[Tuple[Tensor, Tensor, float]]] = None,
+    fixed_features: Optional[dict[int, float]] = None,
+    options: Optional[dict[str, Union[bool, float, int]]] = None,
+    inequality_constraints: Optional[list[tuple[Tensor, Tensor, float]]] = None,
+    equality_constraints: Optional[list[tuple[Tensor, Tensor, float]]] = None,
 ) -> Optional[Tensor]:
     r"""Generate a batch of smart initializations for qKnowledgeGradient.
 
     This function generates initial conditions for optimizing one-shot KG using
     the maximizer of the posterior objective. Intutively, the maximizer of the
     fantasized posterior will often be close to a maximizer of the current
-    posterior. This function uses that fact to generate the initital conditions
+    posterior. This function uses that fact to generate the initial conditions
     for the fantasy points. Specifically, a fraction of `1 - frac_random` (see
     options) is generated by sampling from the set of maximizers of the
     posterior objective (obtained via random restart optimization) according to
@@ -435,7 +465,7 @@ def gen_one_shot_kg_initial_conditions(
     strategy in `gen_batch_initial_conditions`.
 
     Args:
-        acq_function: The qKnowledgeGradient instance to be optimized.
+        acq_function: The qHypervolumeKnowledgeGradient instance to be optimized.
         bounds: A `2 x d` tensor of lower and upper bounds for each column of
             task features.
         q: The number of candidates to consider.
@@ -466,10 +496,10 @@ def gen_one_shot_kg_initial_conditions(
         of points (candidate points plus fantasy points).
 
     Example:
-        >>> qKG = qKnowledgeGradient(model, num_fantasies=64)
+        >>> qHVKG = qHypervolumeKnowledgeGradient(model, ref_point=num_fantasies=64)
         >>> bounds = torch.tensor([[0., 0.], [1., 1.]])
-        >>> Xinit = gen_one_shot_kg_initial_conditions(
-        >>>     qKG, bounds, q=3, num_restarts=10, raw_samples=512,
+        >>> Xinit = gen_one_shot_hvkg_initial_conditions(
+        >>>     qHVKG, bounds, q=3, num_restarts=10, raw_samples=512,
         >>>     options={"frac_random": 0.25},
         >>> )
     """
@@ -527,14 +557,212 @@ def gen_one_shot_kg_initial_conditions(
     return ics
 
 
+def gen_one_shot_hvkg_initial_conditions(
+    acq_function: qHypervolumeKnowledgeGradient,
+    bounds: Tensor,
+    q: int,
+    num_restarts: int,
+    raw_samples: int,
+    fixed_features: Optional[dict[int, float]] = None,
+    options: Optional[dict[str, Union[bool, float, int]]] = None,
+    inequality_constraints: Optional[list[tuple[Tensor, Tensor, float]]] = None,
+    equality_constraints: Optional[list[tuple[Tensor, Tensor, float]]] = None,
+) -> Optional[Tensor]:
+    r"""Generate a batch of smart initializations for qHypervolumeKnowledgeGradient.
+
+    This function generates initial conditions for optimizing one-shot HVKG using
+    the hypervolume maximizing set (of fixed size) under the posterior mean.
+    Intutively, the hypervolume maximizing set of the fantasized posterior mean
+    will often be close to a hypervolume maximizing set under the current posterior
+    mean. This function uses that fact to generate the initial conditions
+    for the fantasy points. Specifically, a fraction of `1 - frac_random` (see
+    options) of the restarts are generated by learning the hypervolume maximizing sets
+    under the current posterior mean, where each hypervolume maximizing set is
+    obtained from maximizing the hypervolume from a different starting point. Given
+    a hypervolume maximizing set, the `q` candidate points are selected using to the
+    standard initialization strategy in `gen_batch_initial_conditions`, with the fixed
+    hypervolume maximizing set. The remaining `frac_random` restarts fantasy points
+    as well as all `q` candidate points are chosen according to the standard
+    initialization strategy in `gen_batch_initial_conditions`.
+
+    Args:
+        acq_function: The qKnowledgeGradient instance to be optimized.
+        bounds: A `2 x d` tensor of lower and upper bounds for each column of
+            task features.
+        q: The number of candidates to consider.
+        num_restarts: The number of starting points for multistart acquisition
+            function optimization.
+        raw_samples: The number of raw samples to consider in the initialization
+            heuristic.
+        fixed_features: A map `{feature_index: value}` for features that
+            should be fixed to a particular value during generation.
+        options: Options for initial condition generation. These contain all
+            settings for the standard heuristic initialization from
+            `gen_batch_initial_conditions`. In addition, they contain
+            `frac_random` (the fraction of fully random fantasy points),
+            `num_inner_restarts` and `raw_inner_samples` (the number of random
+            restarts and raw samples for solving the posterior objective
+            maximization problem, respectively) and `eta` (temperature parameter
+            for sampling heuristic from posterior objective maximizers).
+        inequality constraints: A list of tuples (indices, coefficients, rhs),
+            with each tuple encoding an inequality constraint of the form
+            `\sum_i (X[indices[i]] * coefficients[i]) >= rhs`.
+        equality constraints: A list of tuples (indices, coefficients, rhs),
+            with each tuple encoding an inequality constraint of the form
+            `\sum_i (X[indices[i]] * coefficients[i]) = rhs`.
+
+    Returns:
+        A `num_restarts x q' x d` tensor that can be used as initial conditions
+        for `optimize_acqf()`. Here `q' = q + num_fantasies` is the total number
+        of points (candidate points plus fantasy points).
+
+    Example:
+        >>> qHVKG = qHypervolumeKnowledgeGradient(model, ref_point)
+        >>> bounds = torch.tensor([[0., 0.], [1., 1.]])
+        >>> Xinit = gen_one_shot_hvkg_initial_conditions(
+        >>>     qHVKG, bounds, q=3, num_restarts=10, raw_samples=512,
+        >>>     options={"frac_random": 0.25},
+        >>> )
+    """
+    from botorch.optim.optimize import optimize_acqf
+
+    options = options or {}
+    frac_random: float = options.get("frac_random", 0.1)
+    if not 0 < frac_random < 1:
+        raise ValueError(
+            f"frac_random must take on values in (0,1). Value: {frac_random}"
+        )
+
+    value_function = _get_hv_value_function(
+        model=acq_function.model,
+        ref_point=acq_function.ref_point,
+        objective=acq_function.objective,
+        sampler=acq_function.inner_sampler,
+        use_posterior_mean=acq_function.use_posterior_mean,
+    )
+
+    is_mf_hvkg = isinstance(acq_function, qMultiFidelityHypervolumeKnowledgeGradient)
+    if is_mf_hvkg:
+        dim = bounds.shape[-1]
+        fidelity_dims, fidelity_targets = zip(*acq_function.target_fidelities.items())
+        value_function = FixedFeatureAcquisitionFunction(
+            acq_function=value_function,
+            d=dim,
+            columns=fidelity_dims,
+            values=fidelity_targets,
+        )
+
+        non_fidelity_dims = list(set(range(dim)) - set(fidelity_dims))
+
+    num_optim_restarts = int(round(num_restarts * (1 - frac_random)))
+    fantasy_cands, fantasy_vals = optimize_acqf(
+        acq_function=value_function,
+        bounds=bounds[:, non_fidelity_dims] if is_mf_hvkg else bounds,
+        q=acq_function.num_pareto,
+        num_restarts=options.get("num_inner_restarts", 20),
+        raw_samples=options.get("raw_inner_samples", 1024),
+        fixed_features=fixed_features,
+        return_best_only=False,
+        options=options,
+        inequality_constraints=inequality_constraints,
+        equality_constraints=equality_constraints,
+        sequential=False,
+    )
+    # sampling from the optimizers
+    eta = options.get("eta", 2.0)
+    if num_optim_restarts > 0:
+        probs = torch.nn.functional.softmax(eta * standardize(fantasy_vals), dim=0)
+        idx = torch.multinomial(
+            probs,
+            num_optim_restarts * acq_function.num_fantasies,
+            replacement=True,
+        )
+        optim_ics = fantasy_cands[idx]
+        if is_mf_hvkg:
+            # add fixed features
+            optim_ics = value_function._construct_X_full(optim_ics)
+        optim_ics = optim_ics.reshape(
+            num_optim_restarts, acq_function.num_pseudo_points, bounds.shape[-1]
+        )
+
+    # get random initial conditions
+    num_random_restarts = num_restarts - num_optim_restarts
+    if num_random_restarts > 0:
+        q_aug = acq_function.get_augmented_q_batch_size(q=q)
+        base_ics = gen_batch_initial_conditions(
+            acq_function=acq_function,
+            bounds=bounds,
+            q=q_aug,
+            num_restarts=num_restarts,
+            raw_samples=raw_samples,
+            fixed_features=fixed_features,
+            options=options,
+            inequality_constraints=inequality_constraints,
+            equality_constraints=equality_constraints,
+        )
+
+        if num_optim_restarts > 0:
+            probs = torch.full(
+                (num_restarts,),
+                1.0 / num_restarts,
+                dtype=optim_ics.dtype,
+                device=optim_ics.device,
+            )
+            optim_idxr = probs.multinomial(
+                num_samples=num_optim_restarts, replacement=False
+            )
+            base_ics[optim_idxr, q:] = optim_ics
+    else:
+        # optim_ics is num_restarts x num_pseudo_points x d
+        # add padding so that base_ics is num_restarts x q+num_pseudo_points x d
+        q_padding = torch.zeros(
+            optim_ics.shape[0],
+            q,
+            optim_ics.shape[-1],
+            dtype=optim_ics.dtype,
+            device=optim_ics.device,
+        )
+        base_ics = torch.cat([q_padding, optim_ics], dim=-2)
+
+    if num_optim_restarts > 0:
+        all_ics = []
+        if num_random_restarts > 0:
+            optim_idcs = optim_idxr.view(-1).tolist()
+        else:
+            optim_idcs = list(range(num_restarts))
+        for i in list(range(num_restarts)):
+            if i in optim_idcs:
+                # optimize the q points,
+                # given fixed, optimized fantasy designs
+                ics = gen_batch_initial_conditions(
+                    acq_function=acq_function,
+                    bounds=bounds,
+                    q=q,
+                    num_restarts=1,
+                    raw_samples=raw_samples,
+                    fixed_features=fixed_features,
+                    options=options,
+                    inequality_constraints=inequality_constraints,
+                    equality_constraints=equality_constraints,
+                    fixed_X_fantasies=base_ics[i, q:],
+                )
+            else:
+                # ics are all randomly sampled
+                ics = base_ics[i : i + 1]
+            all_ics.append(ics)
+        return torch.cat(all_ics, dim=0)
+
+    return base_ics
+
+
 def gen_value_function_initial_conditions(
     acq_function: AcquisitionFunction,
     bounds: Tensor,
     num_restarts: int,
     raw_samples: int,
     current_model: Model,
-    fixed_features: Optional[Dict[int, float]] = None,
-    options: Optional[Dict[str, Union[bool, float, int]]] = None,
+    fixed_features: Optional[dict[int, float]] = None,
+    options: Optional[dict[str, Union[bool, float, int]]] = None,
 ) -> Tensor:
     r"""Generate a batch of smart initializations for optimizing
     the value function of qKnowledgeGradient.
@@ -1039,3 +1267,34 @@ def sample_perturbed_subset_dims(
     # Create candidate points
     X_cand[mask] = pert[mask]
     return X_cand
+
+
+def is_nonnegative(acq_function: AcquisitionFunction) -> bool:
+    r"""Determine whether a given acquisition function is non-negative.
+
+    Args:
+        acq_function: The `AcquisitionFunction` instance.
+
+    Returns:
+        True if `acq_function` is non-negative, False if not, or if the behavior
+        is unknown (for custom acquisition functions).
+
+    Example:
+        >>> qEI = qExpectedImprovement(model, best_f=0.1)
+        >>> is_nonnegative(qEI)  # returns True
+    """
+    return isinstance(
+        acq_function,
+        (
+            analytic.ExpectedImprovement,
+            analytic.ConstrainedExpectedImprovement,
+            analytic.ProbabilityOfImprovement,
+            analytic.NoisyExpectedImprovement,
+            monte_carlo.qExpectedImprovement,
+            monte_carlo.qNoisyExpectedImprovement,
+            monte_carlo.qProbabilityOfImprovement,
+            multi_objective.analytic.ExpectedHypervolumeImprovement,
+            multi_objective.monte_carlo.qExpectedHypervolumeImprovement,
+            multi_objective.monte_carlo.qNoisyExpectedHypervolumeImprovement,
+        ),
+    )

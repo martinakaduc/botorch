@@ -11,7 +11,7 @@ Base class for test functions for optimization benchmarks.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import List, Optional, Tuple
+from typing import Optional, Union
 
 import torch
 from botorch.exceptions.errors import InputDataError
@@ -23,14 +23,20 @@ class BaseTestProblem(Module, ABC):
     r"""Base class for test functions."""
 
     dim: int
-    _bounds: List[Tuple[float, float]]
+    _bounds: list[tuple[float, float]]
     _check_grad_at_opt: bool = True
 
-    def __init__(self, noise_std: Optional[float] = None, negate: bool = False) -> None:
+    def __init__(
+        self,
+        noise_std: Union[None, float, list[float]] = None,
+        negate: bool = False,
+    ) -> None:
         r"""Base constructor for test functions.
 
         Args:
-            noise_std: Standard deviation of the observation noise.
+            noise_std: Standard deviation of the observation noise. If a list is
+                provided, specifies separate noise standard deviations for each
+                objective in a multiobjective problem.
             negate: If True, negate the function.
         """
         super().__init__()
@@ -42,7 +48,7 @@ class BaseTestProblem(Module, ABC):
                 f"Got {self.dim=} and {len(self._bounds)=}."
             )
         self.register_buffer(
-            "bounds", torch.tensor(self._bounds, dtype=torch.float).transpose(-1, -2)
+            "bounds", torch.tensor(self._bounds, dtype=torch.double).transpose(-1, -2)
         )
 
     def forward(self, X: Tensor, noise: bool = True) -> Tensor:
@@ -60,7 +66,8 @@ class BaseTestProblem(Module, ABC):
         X = X if batch else X.unsqueeze(0)
         f = self.evaluate_true(X=X)
         if noise and self.noise_std is not None:
-            f += self.noise_std * torch.randn_like(f)
+            _noise = torch.tensor(self.noise_std, device=X.device, dtype=X.dtype)
+            f += _noise * torch.randn_like(f)
         if self.negate:
             f = -f
         return f if batch else f.squeeze(0)
@@ -82,6 +89,7 @@ class ConstrainedBaseTestProblem(BaseTestProblem, ABC):
 
     num_constraints: int
     _check_grad_at_opt: bool = False
+    constraint_noise_std: Union[None, float, list[float]] = None
 
     def evaluate_slack(self, X: Tensor, noise: bool = True) -> Tensor:
         r"""Evaluate the constraint slack on a set of points.
@@ -101,10 +109,11 @@ class ConstrainedBaseTestProblem(BaseTestProblem, ABC):
                 corresponds to the constraint being feasible).
         """
         cons = self.evaluate_slack_true(X=X)
-        if noise and self.noise_std is not None:
-            # TODO: Allow different noise levels for objective and constraints (and
-            # different noise levels between different constraints)
-            cons += self.noise_std * torch.randn_like(cons)
+        if noise and self.constraint_noise_std is not None:
+            _constraint_noise = torch.tensor(
+                self.constraint_noise_std, device=X.device, dtype=X.dtype
+            )
+            cons += _constraint_noise * torch.randn_like(cons)
         return cons
 
     def is_feasible(self, X: Tensor, noise: bool = True) -> Tensor:
@@ -136,35 +145,46 @@ class ConstrainedBaseTestProblem(BaseTestProblem, ABC):
         pass  # pragma: no cover
 
 
-class MultiObjectiveTestProblem(BaseTestProblem):
-    r"""Base class for test multi-objective test functions.
+class MultiObjectiveTestProblem(BaseTestProblem, ABC):
+    r"""Base class for multi-objective test functions.
 
     TODO: add a pareto distance function that returns the distance
     between a provided point and the closest point on the true pareto front.
     """
 
     num_objectives: int
-    _ref_point: List[float]
-    _max_hv: float
+    _ref_point: list[float]
+    _max_hv: Optional[float] = None
 
-    def __init__(self, noise_std: Optional[float] = None, negate: bool = False) -> None:
+    def __init__(
+        self,
+        noise_std: Union[None, float, list[float]] = None,
+        negate: bool = False,
+    ) -> None:
         r"""Base constructor for multi-objective test functions.
 
         Args:
-            noise_std: Standard deviation of the observation noise.
+            noise_std: Standard deviation of the observation noise. If a list is
+                provided, specifies separate noise standard deviations for each
+                objective.
             negate: If True, negate the objectives.
         """
+        if isinstance(noise_std, list) and len(noise_std) != len(self._ref_point):
+            raise InputDataError(
+                f"If specified as a list, length of noise_std ({len(noise_std)}) "
+                f"must match the number of objectives ({len(self._ref_point)})"
+            )
         super().__init__(noise_std=noise_std, negate=negate)
-        ref_point = torch.tensor(self._ref_point, dtype=torch.float)
+        ref_point = torch.tensor(self._ref_point, dtype=torch.get_default_dtype())
         if negate:
             ref_point *= -1
         self.register_buffer("ref_point", ref_point)
 
     @property
     def max_hv(self) -> float:
-        try:
+        if self._max_hv is not None:
             return self._max_hv
-        except AttributeError:
+        else:
             raise NotImplementedError(
                 f"Problem {self.__class__.__name__} does not specify maximal "
                 "hypervolume."

@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from math import pi
 
-from typing import Any, Callable, Optional, Tuple, Union
+from typing import Callable, Optional, Union
 
 import torch
 from botorch.acquisition.max_value_entropy_search import qMaxValueEntropy
@@ -64,7 +64,7 @@ class qMultiObjectiveMaxValueEntropy(
         _default_sample_shape: The `sample_shape` for the default sampler.
 
     Example:
-        >>> model = SingleTaskGP(train_X, train_Y)
+        >>> model = SingleTaskGP(train_X, train_Y, outcome_transform=None)
         >>> MESMO = qMultiObjectiveMaxValueEntropy(model, sample_pfs)
         >>> mesmo = MESMO(test_X)
     """
@@ -78,7 +78,6 @@ class qMultiObjectiveMaxValueEntropy(
         num_fantasies: int = 16,
         X_pending: Optional[Tensor] = None,
         sampler: Optional[MCSampler] = None,
-        **kwargs: Any,
     ) -> None:
         r"""Multi-objective max-value entropy search acquisition function.
 
@@ -110,10 +109,6 @@ class qMultiObjectiveMaxValueEntropy(
             model_list_to_batched(model) if isinstance(model, ModelListGP) else model
         )
         self._init_model = batched_mo_model
-        self.mo_model = batched_mo_model
-        self.model = batched_multi_output_to_single_output(
-            batch_mo_model=batched_mo_model
-        )
         self.fantasies_sampler = SobolQMCNormalSampler(
             sample_shape=torch.Size([num_fantasies])
         )
@@ -122,12 +117,8 @@ class qMultiObjectiveMaxValueEntropy(
         self.maximize = True
         self.weight = 1.0
         self.sample_pareto_frontiers = sample_pareto_frontiers
-
-        # this avoids unnecessary model conversion if X_pending is None
-        if X_pending is None:
-            self._sample_max_values()
-        else:
-            self.set_X_pending(X_pending)
+        # Set X_pending, register converted model and sample max values.
+        self.set_X_pending(X_pending)
         # This avoids attribute errors in qMaxValueEntropy code.
         self.posterior_transform = None
 
@@ -146,7 +137,8 @@ class qMultiObjectiveMaxValueEntropy(
         if X_pending is not None:
             # fantasize the model
             fantasy_model = self._init_model.fantasize(
-                X=X_pending, sampler=self.fantasies_sampler, observation_noise=True
+                X=X_pending,
+                sampler=self.fantasies_sampler,
             )
             self.mo_model = fantasy_model
             # convert model to batched single outcome model.
@@ -164,7 +156,9 @@ class qMultiObjectiveMaxValueEntropy(
             self._sample_max_values()
 
     def _sample_max_values(self) -> None:
-        r"""Sample max values for MC approximation of the expectation in MES"""
+        """Sample max values for MC approximation of the expectation in MES.
+
+        Sets self.posterior_max_values."""
         with torch.no_grad():
             # num_samples x (num_fantasies) x n_pareto_points x m
             sampled_pfs = self.sample_pareto_frontiers(self.mo_model)
@@ -219,7 +213,6 @@ class qLowerBoundMultiObjectiveMaxValueEntropySearch(
         X_pending: Optional[Tensor] = None,
         estimation_type: str = "LB",
         num_samples: int = 64,
-        **kwargs: Any,
     ) -> None:
         r"""Lower bound multi-objective max-value entropy search acquisition function.
 
@@ -329,7 +322,7 @@ class qLowerBoundMultiObjectiveMaxValueEntropySearch(
 
     def _compute_monte_carlo_variables(
         self, posterior: GPyTorchPosterior
-    ) -> Tuple[Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor]:
         r"""Compute the samples and log-probability associated with a posterior
         distribution.
 

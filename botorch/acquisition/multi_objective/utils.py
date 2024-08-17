@@ -13,7 +13,7 @@ from __future__ import annotations
 import math
 import warnings
 from math import ceil
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Optional
 
 import torch
 from botorch.acquisition import monte_carlo  # noqa F401
@@ -27,7 +27,7 @@ from botorch.models.deterministic import GenericDeterministicModel
 from botorch.models.fully_bayesian import MCMC_DIM
 from botorch.models.model import Model
 from botorch.sampling.get_sampler import get_sampler
-from botorch.utils.gp_sampling import get_gp_samples
+from botorch.sampling.pathwise.posterior_samplers import get_matheron_path_model
 from botorch.utils.multi_objective.box_decompositions.box_decomposition import (
     BoxDecomposition,
 )
@@ -38,8 +38,9 @@ from botorch.utils.multi_objective.box_decompositions.dominated import (
     DominatedPartitioning,
 )
 from botorch.utils.multi_objective.pareto import is_non_dominated
+from botorch.utils.objective import compute_feasibility_indicator
 from botorch.utils.sampling import draw_sobol_samples
-from botorch.utils.transforms import is_fully_bayesian, normalize_indices
+from botorch.utils.transforms import is_ensemble
 from torch import Tensor
 
 
@@ -68,7 +69,7 @@ def prune_inferior_points_multi_objective(
     X: Tensor,
     ref_point: Tensor,
     objective: Optional[MCMultiOutputObjective] = None,
-    constraints: Optional[List[Callable[[Tensor], Tensor]]] = None,
+    constraints: Optional[list[Callable[[Tensor], Tensor]]] = None,
     num_samples: int = 2048,
     max_frac: float = 1.0,
     marginalize_dim: Optional[int] = None,
@@ -109,7 +110,7 @@ def prune_inferior_points_multi_objective(
         with `N_nz` the number of points in `X` that have non-zero (empirical,
         under `num_samples` samples) probability of being pareto optimal.
     """
-    if marginalize_dim is None and is_fully_bayesian(model):
+    if marginalize_dim is None and is_ensemble(model):
         # TODO: Properly deal with marginalizing fully Bayesian models
         marginalize_dim = MCMC_DIM
 
@@ -119,9 +120,11 @@ def prune_inferior_points_multi_objective(
             "Batched inputs `X` are currently unsupported by "
             "prune_inferior_points_multi_objective"
         )
-    max_points = math.ceil(max_frac * X.size(-2))
-    if max_points < 1 or max_points > X.size(-2):
+    if X.size(-2) == 0:
+        raise ValueError("X must have at least one point.")
+    if max_frac <= 0 or max_frac > 1.0:
         raise ValueError(f"max_frac must take values in (0, 1], is {max_frac}")
+    max_points = math.ceil(max_frac * X.size(-2))
     with torch.no_grad():
         posterior = model.posterior(X=X)
     sampler = get_sampler(posterior, sample_shape=torch.Size([num_samples]))
@@ -138,19 +141,12 @@ def prune_inferior_points_multi_objective(
                 "Models with multiple batch dims are currently unsupported by"
                 " prune_inferior_points_multi_objective."
             )
-    if constraints is not None:
-        infeas = torch.stack([c(samples) > 0 for c in constraints], dim=0).any(dim=0)
-        if infeas.ndim == 3 and marginalize_dim is not None:
-            # make sure marginalize_dim is not negative
-            if marginalize_dim < 0:
-                # add 1 to the normalize marginalize_dim since we have already
-                # removed the output dim
-                marginalize_dim = (
-                    1 + normalize_indices([marginalize_dim], d=infeas.ndim)[0]
-                )
-
-            infeas = infeas.float().mean(dim=marginalize_dim).round().bool()
-        # set infeasible points to be the ref point
+    infeas = ~compute_feasibility_indicator(
+        constraints=constraints,
+        samples=samples,
+        marginalize_dim=marginalize_dim,
+    )
+    if infeas.any():
         obj_vals[infeas] = ref_point
     pareto_mask = is_non_dominated(obj_vals, deduplicate=False) & (
         obj_vals > ref_point
@@ -273,7 +269,7 @@ def random_search_optimizer(
     maximize: bool,
     pop_size: int = 1024,
     max_tries: int = 10,
-) -> Tuple[Tensor, Tensor]:
+) -> tuple[Tensor, Tensor]:
     r"""Optimize a function via random search.
 
     Args:
@@ -322,12 +318,11 @@ def sample_optimal_points(
     num_samples: int,
     num_points: int,
     optimizer: Callable[
-        [GenericDeterministicModel, Tensor, int, bool, Any], Tuple[Tensor, Tensor]
+        [GenericDeterministicModel, Tensor, int, bool, Any], tuple[Tensor, Tensor]
     ] = random_search_optimizer,
-    num_rff_features: int = 512,
     maximize: bool = True,
-    optimizer_kwargs: Optional[Dict[str, Any]] = None,
-) -> Tuple[Tensor, Tensor]:
+    optimizer_kwargs: Optional[dict[str, Any]] = None,
+) -> tuple[Tensor, Tensor]:
     r"""Compute a collection of optimal inputs and outputs from samples of a Gaussian
     Process (GP).
 
@@ -348,7 +343,6 @@ def sample_optimal_points(
         num_samples: The number of GP samples.
         num_points: The number of optimal points to be outputted.
         optimizer: A callable that solves the deterministic optimization problem.
-        num_rff_features: The number of random Fourier features.
         maximize: If true, we consider a maximization problem.
         optimizer_kwargs: The additional arguments for the optimizer.
 
@@ -360,7 +354,7 @@ def sample_optimal_points(
         - A `num_samples x num_points x M`-dim Tensor containing the collection of
             optimal objectives.
     """
-    tkwargs = {"dtype": bounds.dtype, "device": bounds.device}
+    tkwargs: dict[str, Any] = {"dtype": bounds.dtype, "device": bounds.device}
     M = model.num_outputs
     d = bounds.shape[-1]
     if M == 1:
@@ -373,9 +367,7 @@ def sample_optimal_points(
     pareto_sets = torch.zeros((num_samples, num_points, d), **tkwargs)
     pareto_fronts = torch.zeros((num_samples, num_points, M), **tkwargs)
     for i in range(num_samples):
-        sample_i = get_gp_samples(
-            model=model, num_outputs=M, n_samples=1, num_rff_features=num_rff_features
-        )
+        sample_i = get_matheron_path_model(model=model)
         ps_i, pf_i = optimizer(
             model=sample_i,
             bounds=bounds,

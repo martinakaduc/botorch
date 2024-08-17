@@ -4,7 +4,15 @@
 # LICENSE file in the root directory of this source tree.
 
 r"""
-Batch implementations of the LogEI family of improvements-based acquisition functions.
+Monte-Carlo variants of the LogEI family of improvements-based acquisition functions,
+see [Ament2023logei]_ for details.
+
+References
+
+.. [Ament2023logei]
+    S. Ament, S. Daulton, D. Eriksson, M. Balandat, and E. Bakshy.
+    Unexpected Improvements to Expected Improvement for Bayesian Optimization. Advances
+    in Neural Information Processing Systems 36, 2023.
 """
 
 from __future__ import annotations
@@ -13,10 +21,10 @@ from copy import deepcopy
 
 from functools import partial
 
-from typing import Any, Callable, List, Optional, Tuple, TypeVar, Union
+from typing import Callable, Optional, TypeVar, Union
 
 import torch
-from botorch.acquisition.cached_cholesky import CachedCholeskyMCAcquisitionFunction
+from botorch.acquisition.cached_cholesky import CachedCholeskyMCSamplerMixin
 from botorch.acquisition.monte_carlo import SampleReducingMCAcquisitionFunction
 from botorch.acquisition.objective import (
     ConstrainedMCObjective,
@@ -63,8 +71,6 @@ FloatOrTensor = TypeVar("FloatOrTensor", float, Tensor)
 class LogImprovementMCAcquisitionFunction(SampleReducingMCAcquisitionFunction):
     r"""
     Abstract base class for Monte-Carlo-based batch LogEI acquisition functions.
-
-    :meta private:
     """
 
     _log: bool = True
@@ -76,7 +82,7 @@ class LogImprovementMCAcquisitionFunction(SampleReducingMCAcquisitionFunction):
         objective: Optional[MCAcquisitionObjective] = None,
         posterior_transform: Optional[PosteriorTransform] = None,
         X_pending: Optional[Tensor] = None,
-        constraints: Optional[List[Callable[[Tensor], Tensor]]] = None,
+        constraints: Optional[list[Callable[[Tensor], Tensor]]] = None,
         eta: Union[Tensor, float] = 1e-3,
         fat: bool = True,
         tau_max: float = TAU_MAX,
@@ -138,9 +144,11 @@ class qLogExpectedImprovement(LogImprovementMCAcquisitionFunction):
     (3) smoothly maximizing over q, and
     (4) averaging over the samples in log space.
 
-    `qLogEI(X) ~ log(qEI(X)) = log(E(max(max Y - best_f, 0)))`,
+    See [Ament2023logei]_ for details. Formally,
 
-    where `Y ~ f(X)`, and `X = (x_1,...,x_q)`.
+    `qLogEI(X) ~ log(qEI(X)) = log(E(max(max Y - best_f, 0)))`.
+
+    where `Y ~ f(X)`, and `X = (x_1,...,x_q)`, .
 
     Example:
         >>> model = SingleTaskGP(train_X, train_Y)
@@ -158,7 +166,7 @@ class qLogExpectedImprovement(LogImprovementMCAcquisitionFunction):
         objective: Optional[MCAcquisitionObjective] = None,
         posterior_transform: Optional[PosteriorTransform] = None,
         X_pending: Optional[Tensor] = None,
-        constraints: Optional[List[Callable[[Tensor], Tensor]]] = None,
+        constraints: Optional[list[Callable[[Tensor], Tensor]]] = None,
         eta: Union[Tensor, float] = 1e-3,
         fat: bool = True,
         tau_max: float = TAU_MAX,
@@ -169,8 +177,8 @@ class qLogExpectedImprovement(LogImprovementMCAcquisitionFunction):
         Args:
             model: A fitted model.
             best_f: The best objective value observed so far (assumed noiseless). Can be
-                a `batch_shape`-shaped tensor, which in case of a batched model
-                specifies potentially different values for each element of the batch.
+                a scalar, or a `batch_shape`-dim tensor. In case of a batched model, the
+                tensor can specify different values for each element of the batch.
             sampler: The sampler used to draw base samples. See `MCAcquisitionFunction`
                 more details.
             objective: The MCAcquisitionObjective under which the samples are evaluated.
@@ -205,7 +213,7 @@ class qLogExpectedImprovement(LogImprovementMCAcquisitionFunction):
             tau_max=check_tau(tau_max, name="tau_max"),
             fat=fat,
         )
-        self.register_buffer("best_f", torch.as_tensor(best_f))
+        self.register_buffer("best_f", torch.as_tensor(best_f, dtype=float))
         self.tau_relu = check_tau(tau_relu, name="tau_relu")
 
     def _sample_forward(self, obj: Tensor) -> Tensor:
@@ -227,7 +235,7 @@ class qLogExpectedImprovement(LogImprovementMCAcquisitionFunction):
 
 
 class qLogNoisyExpectedImprovement(
-    LogImprovementMCAcquisitionFunction, CachedCholeskyMCAcquisitionFunction
+    LogImprovementMCAcquisitionFunction, CachedCholeskyMCSamplerMixin
 ):
     r"""MC-based batch Log Noisy Expected Improvement.
 
@@ -237,8 +245,11 @@ class qLogNoisyExpectedImprovement(
     to the canonical improvement over previously observed points is computed
     for each sample and the logarithm of the average is returned.
 
-    `qLogNEI(X) ~ log(qNEI(X)) = Log E(max(max Y - max Y_baseline, 0))`, where
-    `(Y, Y_baseline) ~ f((X, X_baseline)), X = (x_1,...,x_q)`
+    See [Ament2023logei]_ for details. Formally,
+
+    `qLogNEI(X) ~ log(qNEI(X)) = Log E(max(max Y - max Y_baseline, 0))`,
+
+    where `(Y, Y_baseline) ~ f((X, X_baseline)), X = (x_1,...,x_q)`.
 
     Example:
         >>> model = SingleTaskGP(train_X, train_Y)
@@ -255,14 +266,14 @@ class qLogNoisyExpectedImprovement(
         objective: Optional[MCAcquisitionObjective] = None,
         posterior_transform: Optional[PosteriorTransform] = None,
         X_pending: Optional[Tensor] = None,
-        constraints: Optional[List[Callable[[Tensor], Tensor]]] = None,
+        constraints: Optional[list[Callable[[Tensor], Tensor]]] = None,
         eta: Union[Tensor, float] = 1e-3,
         fat: bool = True,
         prune_baseline: bool = False,
         cache_root: bool = True,
         tau_max: float = TAU_MAX,
         tau_relu: float = TAU_RELU,
-        **kwargs: Any,
+        marginalize_dim: Optional[int] = None,
     ) -> None:
         r"""q-Noisy Expected Improvement.
 
@@ -301,7 +312,7 @@ class qLogNoisyExpectedImprovement(
                 approximations to max.
             tau_relu: Temperature parameter controlling the sharpness of the smooth
                 approximations to ReLU.
-            kwargs: Here for qNEI for compatibility.
+            marginalize_dim: The dimension to marginalize over.
 
         TODO: similar to qNEHVI, when we are using sequential greedy candidate
         selection, we could incorporate pending points X_baseline and compute
@@ -330,7 +341,7 @@ class qLogNoisyExpectedImprovement(
             posterior_transform=posterior_transform,
             prune_baseline=prune_baseline,
             cache_root=cache_root,
-            **kwargs,
+            marginalize_dim=marginalize_dim,
         )
 
     def _sample_forward(self, obj: Tensor) -> Tensor:
@@ -359,17 +370,19 @@ class qLogNoisyExpectedImprovement(
         posterior_transform: Optional[PosteriorTransform] = None,
         prune_baseline: bool = False,
         cache_root: bool = True,
-        **kwargs: Any,
+        marginalize_dim: Optional[int] = None,
     ) -> None:
-        # setup of CachedCholeskyMCAcquisitionFunction
-        self._setup(model=model, cache_root=cache_root)
+        CachedCholeskyMCSamplerMixin.__init__(
+            self, model=model, cache_root=cache_root, sampler=sampler
+        )
         if prune_baseline:
             X_baseline = prune_inferior_points(
                 model=model,
                 X=X_baseline,
                 objective=objective,
                 posterior_transform=posterior_transform,
-                marginalize_dim=kwargs.get("marginalize_dim"),
+                marginalize_dim=marginalize_dim,
+                constraints=self._constraints,
             )
         self.register_buffer("X_baseline", X_baseline)
         # registering buffers for _get_samples_and_objectives in the next `if` block
@@ -413,7 +426,7 @@ class qLogNoisyExpectedImprovement(
             obj: `sample_shape x batch_shape x q`-dim Tensor of objectives in forward.
 
         Returns:
-            A `sample_shape x batch_shape x 1`-dim Tensor of best feasible objectives.
+            A `sample_shape x batch_shape`-dim Tensor of best feasible objectives.
         """
         if self._cache_root:
             val = self._baseline_best_f
@@ -426,13 +439,13 @@ class qLogNoisyExpectedImprovement(
         view_shape = torch.Size(
             [
                 *val.shape[:n_sample_dims],  # sample dimensions
-                *(1,) * (obj.ndim - val.ndim),  # pad to match obj
+                *(1,) * (obj.ndim - val.ndim - 1),  # pad to match obj without `q`-dim
                 *val.shape[n_sample_dims:],  # the rest
             ]
         )
-        return val.view(view_shape).to(obj)
+        return val.view(view_shape).to(obj)  # obj.shape[:-1], i.e. without `q`-dim`
 
-    def _get_samples_and_objectives(self, X: Tensor) -> Tuple[Tensor, Tensor]:
+    def _get_samples_and_objectives(self, X: Tensor) -> tuple[Tensor, Tensor]:
         r"""Compute samples at new points, using the cached root decomposition.
 
         Args:
@@ -468,6 +481,15 @@ class qLogNoisyExpectedImprovement(
         return samples, obj
 
     def _compute_best_feasible_objective(self, samples: Tensor, obj: Tensor) -> Tensor:
+        r"""Computes best feasible objective value from samples.
+
+        Args:
+            samples: `sample_shape x batch_shape x q x m`-dim posterior samples.
+            obj: A `sample_shape x batch_shape x q`-dim Tensor of MC objective values.
+
+        Returns:
+            A `sample_shape x batch_shape`-dim Tensor of best feasible objectives.
+        """
         return compute_best_feasible_objective(
             samples=samples,
             obj=obj,
@@ -497,7 +519,8 @@ def _log_improvement(
 
     Args:
         obj: `mc_samples x batch_shape x q`-dim Tensor of output samples.
-        best_f: Best previously observed objective value(s), broadcastable with `obj`.
+        best_f: Best previously observed objective value(s), broadcastable with
+            `mc_samples x batch_shape`-dim Tensor, i.e. `obj`'s dims without `q`.
         tau: Temperature parameter for smooth approximation of ReLU.
             as `tau -> 0`, maximum pointwise approximation error is linear w.r.t. `tau`.
         fat: Toggles the logarithmic / linear asymptotic behavior of the
@@ -507,7 +530,7 @@ def _log_improvement(
         A `mc_samples x batch_shape x q`-dim Tensor of improvement values.
     """
     log_soft_clamp = log_fatplus if fat else log_softplus
-    Z = Y - best_f.to(Y)
+    Z = Y - best_f.unsqueeze(-1).to(Y)
     return log_soft_clamp(Z, tau=tau)  # ~ ((Y - best_f) / Y_std).clamp(0)
 
 

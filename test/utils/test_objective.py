@@ -10,7 +10,6 @@ from botorch.utils import apply_constraints, get_objective_weights_transform
 from botorch.utils.objective import (
     compute_feasibility_indicator,
     compute_smoothed_feasibility_indicator,
-    soft_eval_constraint,
 )
 from botorch.utils.testing import BotorchTestCase
 from torch import Tensor
@@ -74,15 +73,6 @@ class TestApplyConstraints(BotorchTestCase):
                 infeasible_cost=0.0,
                 eta=0.0,
             )
-
-        # soft_eval_constraint is not in the path of apply_constraints, adding this test
-        # for coverage.
-        with self.assertRaisesRegex(ValueError, "eta must be positive."):
-            soft_eval_constraint(lhs=obj, eta=0.0)
-        ind = soft_eval_constraint(lhs=ones_f(samples), eta=1e-6)
-        self.assertAllClose(ind, torch.zeros_like(ind))
-        ind = soft_eval_constraint(lhs=-ones_f(samples), eta=1e-6)
-        self.assertAllClose(ind, torch.ones_like(ind))
 
     def test_apply_constraints_multi_output(self):
         # nonnegative objective, one constraint
@@ -203,7 +193,7 @@ class TestApplyConstraints(BotorchTestCase):
         # nonnegative objective, one constraint
         samples = torch.randn(1)
         ind = compute_feasibility_indicator(constraints=[zeros_f], samples=samples)
-        self.assertAllClose(ind, torch.zeros_like(ind))
+        self.assertAllClose(ind, torch.ones_like(ind))
         self.assertEqual(ind.dtype, torch.bool)
 
         smoothed_ind = compute_smoothed_feasibility_indicator(
@@ -240,21 +230,34 @@ class TestApplyConstraints(BotorchTestCase):
                 eta=torch.tensor([0.1], device=self.device),
             )
 
+        # test marginalize_dim
+        samples = torch.randn(1, 2, 1, 1)
+        ind = compute_feasibility_indicator(
+            constraints=[zeros_f], samples=samples, marginalize_dim=-3
+        )
+        self.assertAllClose(ind, torch.ones_like(ind))
+        self.assertTrue(ind.shape == torch.Size([1, 1]))
+        self.assertEqual(ind.dtype, torch.bool)
+
 
 class TestGetObjectiveWeightsTransform(BotorchTestCase):
-    def test_NoWeights(self):
+    def test_NoWeights(self) -> None:
         Y = torch.ones(5, 2, 4, 1)
         objective_transform = get_objective_weights_transform(None)
         Y_transformed = objective_transform(Y)
         self.assertTrue(torch.equal(Y.squeeze(-1), Y_transformed))
+        Y_transformed_X_None = objective_transform(Y, X=None)
+        self.assertTrue(torch.equal(Y.squeeze(-1), Y_transformed_X_None))
 
-    def test_OneWeightBroadcasting(self):
+    def test_OneWeightBroadcasting(self) -> None:
         Y = torch.ones(5, 2, 4, 1)
         objective_transform = get_objective_weights_transform(torch.tensor([0.5]))
         Y_transformed = objective_transform(Y)
         self.assertTrue(torch.equal(0.5 * Y.sum(dim=-1), Y_transformed))
+        Y_transformed_X_None = objective_transform(Y, X=None)
+        self.assertTrue(torch.equal(0.5 * Y.sum(dim=-1), Y_transformed_X_None))
 
-    def test_IncompatibleNumberOfWeights(self):
+    def test_IncompatibleNumberOfWeights(self) -> None:
         Y = torch.ones(5, 2, 4, 3)
         objective_transform = get_objective_weights_transform(torch.tensor([1.0, 2.0]))
         with self.assertRaises(RuntimeError):

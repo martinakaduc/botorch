@@ -11,7 +11,7 @@ from setuptools import find_packages, setup
 
 # Minimum required python version
 REQUIRED_MAJOR = 3
-REQUIRED_MINOR = 9
+REQUIRED_MINOR = 10
 
 # Requirements for testing, formatting, and tutorials
 TEST_REQUIRES = ["pytest", "pytest-cov"]
@@ -59,9 +59,11 @@ if os.environ.get("ALLOW_LATEST_GPYTORCH_LINOP"):
     # Allows more recent previously installed versions. If there is no
     # previously installed version, installs the latest release.
     install_requires = [
-        dep.replace("==", ">=")
-        if "gpytorch" in dep or "linear_operator" in dep
-        else dep
+        (
+            dep.replace("==", ">=")
+            if "gpytorch" in dep or "linear_operator" in dep
+            else dep
+        )
         for dep in install_requires
     ]
 
@@ -96,7 +98,7 @@ setup(
     ],
     long_description=long_description,
     long_description_content_type="text/markdown",
-    python_requires=">=3.9",
+    python_requires=f">={REQUIRED_MAJOR}.{REQUIRED_MINOR}",
     packages=find_packages(exclude=["test", "test.*"]),
     install_requires=install_requires,
     extras_require={

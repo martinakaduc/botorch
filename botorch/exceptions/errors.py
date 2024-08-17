@@ -25,6 +25,12 @@ class CandidateGenerationError(BotorchError):
     pass
 
 
+class DeprecationError(BotorchError):
+    r"""Exception raised due to deprecations"""
+
+    pass
+
+
 class InputDataError(BotorchError):
     r"""Exception raised when input data does not comply with conventions."""
 

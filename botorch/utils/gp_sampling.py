@@ -6,9 +6,10 @@
 
 from __future__ import annotations
 
+import warnings
 from copy import deepcopy
 from math import pi
-from typing import List, Optional
+from typing import Optional
 
 import torch
 from botorch.models.converter import batched_to_model_list
@@ -17,7 +18,7 @@ from botorch.models.model import Model, ModelList
 from botorch.models.model_list_gp_regression import ModelListGP
 from botorch.models.multitask import MultiTaskGP
 from botorch.utils.sampling import manual_seed
-from botorch.utils.transforms import is_fully_bayesian
+from botorch.utils.transforms import is_ensemble
 from gpytorch.kernels import Kernel, MaternKernel, RBFKernel, ScaleKernel
 from linear_operator.utils.cholesky import psd_safe_cholesky
 from torch import Tensor
@@ -41,6 +42,14 @@ class GPDraw(Module):
         Args:
             model: The Model defining the GP prior.
         """
+        warnings.warn(
+            "`GPDraw` is deprecated and will be removed in v0.13 release. "
+            "For drawing GP sample paths, we recommend using pathwise "
+            "sampling code found in `botorch/sampling/pathwise`. We recommend "
+            "`get_matheron_path_model` for most use cases.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         super().__init__()
         self._model = deepcopy(model)
         self._num_outputs = self._model.num_outputs
@@ -102,9 +111,9 @@ class GPDraw(Module):
         # by default for performance reasonse.
         Ys = posterior.rsample_from_base_samples(
             torch.Size(),
-            base_samples=base_samples.squeeze(-1)
-            if self._num_outputs == 1
-            else base_samples,
+            base_samples=(
+                base_samples.squeeze(-1) if self._num_outputs == 1 else base_samples
+            ),
         )
         self.register_buffer("_Xs", X_eval)
         self.register_buffer("_Ys", Ys)
@@ -134,10 +143,9 @@ class RandomFourierFeatures(Module):
         """
         if not isinstance(kernel, ScaleKernel):
             base_kernel = kernel
-            outputscale = torch.tensor(
-                1.0,
-                dtype=base_kernel.lengthscale.dtype,
-                device=base_kernel.lengthscale.device,
+            outputscale = torch.ones(kernel.batch_shape).to(
+                dtype=kernel.lengthscale.dtype,
+                device=kernel.lengthscale.device,
             )
         else:
             base_kernel = kernel.base_kernel
@@ -284,8 +292,8 @@ class RandomFourierFeatures(Module):
 
 
 def get_deterministic_model_multi_samples(
-    weights: List[Tensor],
-    bases: List[RandomFourierFeatures],
+    weights: list[Tensor],
+    bases: list[RandomFourierFeatures],
 ) -> GenericDeterministicModel:
     """
     Get a batched deterministic model that batch evaluates `n_samples` function
@@ -326,7 +334,7 @@ def get_eval_gp_sample_callable(w: Tensor, basis: RandomFourierFeatures) -> Tens
 
 
 def get_deterministic_model(
-    weights: List[Tensor], bases: List[RandomFourierFeatures]
+    weights: list[Tensor], bases: list[RandomFourierFeatures]
 ) -> GenericDeterministicModel:
     """Get a deterministic model using the provided weights and bases for each output.
 
@@ -349,8 +357,8 @@ def get_deterministic_model(
 
 
 def get_deterministic_model_list(
-    weights: List[Tensor],
-    bases: List[RandomFourierFeatures],
+    weights: list[Tensor],
+    bases: list[RandomFourierFeatures],
 ) -> ModelList:
     """Get a deterministic model list using the provided weights and bases
     for each output.
@@ -429,6 +437,14 @@ def get_gp_samples(
         A `GenericDeterministicModel` that evaluates `n_samples` sampled functions.
         If `n_samples > 1`, this will be a batched model.
     """
+    warnings.warn(
+        "`get_gp_samples` is deprecated and will be removed in v0.13 release. "
+        "For drawing GP sample paths, we recommend using pathwise "
+        "sampling code found in `botorch/sampling/pathwise`. We recommend "
+        "`get_matheron_path_model` for most use cases.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     # Get transforms from the model.
     intf = getattr(model, "input_transform", None)
     octf = getattr(model, "outcome_transform", None)
@@ -503,7 +519,7 @@ def get_gp_samples(
                 models[m].outcome_transform = _octf
             if _intf is not None:
                 base_gp_samples.models[m].input_transform = _intf
-        base_gp_samples.is_fully_bayesian = is_fully_bayesian(model=model)
+        base_gp_samples._is_ensemble = is_ensemble(model=model)
         return base_gp_samples
     elif n_samples > 1:
         base_gp_samples = get_deterministic_model_multi_samples(
@@ -522,5 +538,5 @@ def get_gp_samples(
     if octf is not None:
         base_gp_samples.outcome_transform = octf
         model.outcome_transform = octf
-    base_gp_samples.is_fully_bayesian = is_fully_bayesian(model=model)
+    base_gp_samples._is_ensemble = is_ensemble(model=model)
     return base_gp_samples

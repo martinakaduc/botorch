@@ -15,7 +15,8 @@ from botorch.exceptions import (
     BotorchTensorDimensionError,
     BotorchTensorDimensionWarning,
 )
-from botorch.exceptions.errors import InputDataError
+from botorch.exceptions.errors import DeprecationError, InputDataError
+from botorch.exceptions.warnings import InputDataWarning
 from botorch.fit import fit_gpytorch_mll
 from botorch.models.gpytorch import (
     BatchedMultiOutputGPyTorchModel,
@@ -23,12 +24,14 @@ from botorch.models.gpytorch import (
     ModelListGPyTorchModel,
 )
 from botorch.models.model import FantasizeMixin
+from botorch.models.multitask import MultiTaskGP
 from botorch.models.transforms import Standardize
 from botorch.models.transforms.input import ChainedInputTransform, InputTransform
 from botorch.models.utils import fantasize
 from botorch.posteriors.gpytorch import GPyTorchPosterior
 from botorch.sampling.normal import SobolQMCNormalSampler
-from botorch.utils.testing import BotorchTestCase
+from botorch.utils.test_helpers import SimpleGPyTorchModel
+from botorch.utils.testing import _get_random_data, BotorchTestCase
 from gpytorch import ExactMarginalLogLikelihood
 from gpytorch.distributions import MultivariateNormal
 from gpytorch.kernels import RBFKernel, ScaleKernel
@@ -54,48 +57,6 @@ class SimpleInputTransform(InputTransform, torch.nn.Module):
 
     def transform(self, X: Tensor) -> Tensor:
         return X + self.add_value
-
-
-class SimpleGPyTorchModel(GPyTorchModel, ExactGP, FantasizeMixin):
-    last_fantasize_flag: bool = False
-
-    def __init__(self, train_X, train_Y, outcome_transform=None, input_transform=None):
-        r"""
-        Args:
-            train_X: A tensor of inputs, passed to self.transform_inputs.
-            train_Y: Passed to outcome_transform.
-            outcome_transform: Transform applied to train_Y.
-            input_transform: A Module that performs the input transformation, passed to
-                self.transform_inputs.
-        """
-        with torch.no_grad():
-            transformed_X = self.transform_inputs(
-                X=train_X, input_transform=input_transform
-            )
-        if outcome_transform is not None:
-            train_Y, _ = outcome_transform(train_Y)
-        self._validate_tensor_args(transformed_X, train_Y)
-        train_Y = train_Y.squeeze(-1)
-        likelihood = GaussianLikelihood()
-        super().__init__(train_X, train_Y, likelihood)
-        self.mean_module = ConstantMean()
-        self.covar_module = ScaleKernel(RBFKernel())
-        if outcome_transform is not None:
-            self.outcome_transform = outcome_transform
-        if input_transform is not None:
-            self.input_transform = input_transform
-        self._num_outputs = 1
-        self.to(train_X)
-        self.transformed_call_args = []
-
-    def forward(self, x):
-        self.last_fantasize_flag = fantasize.on()
-        if self.training:
-            x = self.transform_inputs(x)
-        self.transformed_call_args.append(x)
-        mean_x = self.mean_module(x)
-        covar_x = self.covar_module(x)
-        return MultivariateNormal(mean_x, covar_x)
 
 
 class SimpleBatchedMultiOutputGPyTorchModel(
@@ -203,23 +164,31 @@ class TestGPyTorchModel(BotorchTestCase):
             # test subset_output
             with self.assertRaises(NotImplementedError):
                 model.subset_output([0])
+
             # test fantasize
-            sampler = SobolQMCNormalSampler(sample_shape=torch.Size([2]))
-            cm = model.fantasize(torch.rand(2, 1, **tkwargs), sampler=sampler)
-            self.assertIsInstance(cm, SimpleGPyTorchModel)
-            self.assertEqual(cm.train_targets.shape, torch.Size([2, 7]))
-            cm = model.fantasize(
-                torch.rand(2, 1, **tkwargs), sampler=sampler, observation_noise=True
-            )
-            self.assertIsInstance(cm, SimpleGPyTorchModel)
-            self.assertEqual(cm.train_targets.shape, torch.Size([2, 7]))
-            cm = model.fantasize(
-                torch.rand(2, 1, **tkwargs),
-                sampler=sampler,
-                observation_noise=torch.rand(2, 1, **tkwargs),
-            )
-            self.assertIsInstance(cm, SimpleGPyTorchModel)
-            self.assertEqual(cm.train_targets.shape, torch.Size([2, 7]))
+            n_samps = 2
+            sampler = SobolQMCNormalSampler(sample_shape=torch.Size([n_samps]))
+            for n in [0, 2]:
+                x = torch.rand(n, 1, **tkwargs)
+                cm = model.fantasize(X=x, sampler=sampler)
+                self.assertIsInstance(cm, SimpleGPyTorchModel)
+                self.assertEqual(cm.train_targets.shape, torch.Size([n_samps, 5 + n]))
+                cm = model.fantasize(
+                    X=x,
+                    sampler=sampler,
+                    observation_noise=torch.rand(n, 1, **tkwargs),
+                )
+                self.assertIsInstance(cm, SimpleGPyTorchModel)
+                self.assertEqual(cm.train_targets.shape, torch.Size([n_samps, 5 + n]))
+
+            # test that boolean observation noise is deprecated
+            msg = "`fantasize` no longer accepts a boolean for `observation_noise`."
+            with self.assertRaisesRegex(DeprecationError, msg):
+                model.fantasize(
+                    torch.rand(2, 1, **tkwargs),
+                    sampler=sampler,
+                    observation_noise=True,
+                )
 
     def test_validate_tensor_args(self) -> None:
         n, d = 3, 2
@@ -286,6 +255,20 @@ class TestGPyTorchModel(BotorchTestCase):
                     ):
                         GPyTorchModel._validate_tensor_args(X, Y, Yvar, strict=strict)
 
+    def test_condition_on_observations_tensor_validation(self) -> None:
+        model = SimpleGPyTorchModel(torch.rand(5, 1), torch.randn(5, 1))
+        model.posterior(torch.rand(2, 1))  # evaluate the model to form caches.
+        # Outside of fantasize, the inputs are validated.
+        with self.assertWarnsRegex(
+            BotorchTensorDimensionWarning, "Non-strict enforcement of"
+        ):
+            model.condition_on_observations(torch.randn(2, 1), torch.randn(5, 2, 1))
+        # Inside of fantasize, the inputs are not validated.
+        with fantasize(), warnings.catch_warnings(record=True) as ws:
+            warnings.filterwarnings("always", category=BotorchTensorDimensionWarning)
+            model.condition_on_observations(torch.randn(2, 1), torch.randn(5, 2, 1))
+        self.assertFalse(any(w.category is BotorchTensorDimensionWarning for w in ws))
+
     def test_fantasize_flag(self):
         train_X = torch.rand(5, 1)
         train_Y = torch.sin(train_X)
@@ -296,7 +279,7 @@ class TestGPyTorchModel(BotorchTestCase):
         self.assertFalse(model.last_fantasize_flag)
         model.posterior(test_X)
         self.assertFalse(model.last_fantasize_flag)
-        model.fantasize(test_X, SobolQMCNormalSampler(2))
+        model.fantasize(test_X, SobolQMCNormalSampler(sample_shape=torch.Size([2])))
         self.assertTrue(model.last_fantasize_flag)
         model.last_fantasize_flag = False
         with fantasize():
@@ -343,7 +326,7 @@ class TestGPyTorchModel(BotorchTestCase):
         self.assertTrue(torch.equal(post.mean, torch.zeros(3, 1, **tkwargs)))
 
     def test_float_warning_and_dtype_error(self):
-        with self.assertWarnsRegex(UserWarning, "double precision"):
+        with self.assertWarnsRegex(InputDataWarning, "double precision"):
             SimpleGPyTorchModel(torch.rand(5, 1), torch.randn(5, 1))
         with self.assertRaisesRegex(InputDataError, "same dtype"):
             SimpleGPyTorchModel(torch.rand(5, 1), torch.randn(5, 1, dtype=torch.double))
@@ -387,11 +370,6 @@ class TestBatchedMultiOutputGPyTorchModel(BotorchTestCase):
             self.assertIsInstance(cm, SimpleBatchedMultiOutputGPyTorchModel)
             self.assertEqual(cm.train_targets.shape, torch.Size([2, 2, 7]))
             cm = model.fantasize(
-                torch.rand(2, 1, **tkwargs), sampler=sampler, observation_noise=True
-            )
-            self.assertIsInstance(cm, SimpleBatchedMultiOutputGPyTorchModel)
-            self.assertEqual(cm.train_targets.shape, torch.Size([2, 2, 7]))
-            cm = model.fantasize(
                 torch.rand(2, 1, **tkwargs),
                 sampler=sampler,
                 observation_noise=torch.rand(2, 2, **tkwargs),
@@ -404,9 +382,11 @@ class TestBatchedMultiOutputGPyTorchModel(BotorchTestCase):
             for input_batch_dim in (0, 3):
                 for num_outputs in (1, 2):
                     input_batch_shape, aug_batch_shape = get_batch_dims(
-                        train_X=train_X.unsqueeze(0).expand(3, 5, 1)
-                        if input_batch_dim == 3
-                        else train_X,
+                        train_X=(
+                            train_X.unsqueeze(0).expand(3, 5, 1)
+                            if input_batch_dim == 3
+                            else train_X
+                        ),
                         train_Y=train_Y[:, 0:1] if num_outputs == 1 else train_Y,
                     )
                     expected_input_batch_shape = (
@@ -415,9 +395,11 @@ class TestBatchedMultiOutputGPyTorchModel(BotorchTestCase):
                     self.assertEqual(input_batch_shape, expected_input_batch_shape)
                     self.assertEqual(
                         aug_batch_shape,
-                        expected_input_batch_shape + torch.Size([])
-                        if num_outputs == 1
-                        else expected_input_batch_shape + torch.Size([2]),
+                        (
+                            expected_input_batch_shape + torch.Size([])
+                            if num_outputs == 1
+                            else expected_input_batch_shape + torch.Size([2])
+                        ),
                     )
 
     def test_posterior_transform(self):
@@ -484,7 +466,44 @@ class TestModelListGPyTorchModel(BotorchTestCase):
             posterior = model.posterior(test_X)
             self.assertIsInstance(posterior, GPyTorchPosterior)
             self.assertEqual(posterior.mean.shape, torch.Size([2, 2]))
+            # test multioutput
+            train_x_raw, train_y = _get_random_data(
+                batch_shape=torch.Size(), m=1, n=10, **tkwargs
+            )
+            task_idx = torch.cat(
+                [torch.ones(5, 1, **tkwargs), torch.zeros(5, 1, **tkwargs)], dim=0
+            )
+            train_x = torch.cat([train_x_raw, task_idx], dim=-1)
+            model_mt = MultiTaskGP(
+                train_X=train_x,
+                train_Y=train_y,
+                task_feature=-1,
+            )
+            mt_posterior = model_mt.posterior(test_X)
+            model = SimpleModelListGPyTorchModel(m1, model_mt, m2)
+            posterior2 = model.posterior(test_X)
+            expected_mean = torch.cat(
+                (
+                    posterior.mean[:, 0].unsqueeze(-1),
+                    mt_posterior.mean,
+                    posterior.mean[:, 1].unsqueeze(-1),
+                ),
+                dim=1,
+            )
+            self.assertTrue(torch.allclose(expected_mean, posterior2.mean))
+            expected_covariance = torch.block_diag(
+                posterior.covariance_matrix[:2, :2],
+                mt_posterior.covariance_matrix[:2, :2],
+                mt_posterior.covariance_matrix[-2:, -2:],
+                posterior.covariance_matrix[-2:, -2:],
+            )
+            self.assertTrue(
+                torch.allclose(
+                    expected_covariance, posterior2.covariance_matrix, atol=1e-5
+                )
+            )
             # test output indices
+            posterior = model.posterior(test_X)
             for output_indices in ([0], [1], [0, 1]):
                 posterior_subset = model.posterior(
                     test_X, output_indices=output_indices
@@ -494,17 +513,18 @@ class TestModelListGPyTorchModel(BotorchTestCase):
                     posterior_subset.mean.shape, torch.Size([2, len(output_indices)])
                 )
                 self.assertTrue(
-                    torch.equal(
+                    torch.allclose(
                         posterior_subset.mean, posterior.mean[..., output_indices]
                     )
                 )
                 self.assertTrue(
-                    torch.equal(
+                    torch.allclose(
                         posterior_subset.variance,
                         posterior.variance[..., output_indices],
                     )
                 )
             # test observation noise
+            model = SimpleModelListGPyTorchModel(m1, m2)
             posterior = model.posterior(test_X, observation_noise=True)
             self.assertIsInstance(posterior, GPyTorchPosterior)
             self.assertEqual(posterior.mean.shape, torch.Size([2, 2]))

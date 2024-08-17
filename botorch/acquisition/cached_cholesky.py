@@ -6,14 +6,15 @@
 
 r"""
 Abstract class for acquisition functions leveraging a cached Cholesky
-decomposition of the posterior covaiance over f(X_baseline).
+decomposition of the posterior covariance over f(X_baseline).
 """
 from __future__ import annotations
 
 import warnings
-from abc import ABC
+from typing import Optional
 
 import torch
+from botorch.acquisition.acquisition import MCSamplerMixin
 from botorch.exceptions.warnings import BotorchWarning
 from botorch.models.gpytorch import GPyTorchModel
 from botorch.models.higher_order_gp import HigherOrderGP
@@ -22,6 +23,7 @@ from botorch.models.model_list_gp_regression import ModelListGP
 from botorch.models.multitask import KroneckerMultiTaskGP, MultiTaskGP
 from botorch.posteriors.gpytorch import GPyTorchPosterior
 from botorch.posteriors.posterior import Posterior
+from botorch.sampling.base import MCSampler
 from botorch.utils.low_rank import extract_batch_covar, sample_cached_cholesky
 from gpytorch.distributions.multitask_multivariate_normal import (
     MultitaskMultivariateNormal,
@@ -58,20 +60,19 @@ def _get_cache_root_not_supported_message(model_cls: type) -> str:
     return msg
 
 
-class CachedCholeskyMCAcquisitionFunction(ABC):
-    r"""Abstract class for acquisition functions using a cached Cholesky.
+class CachedCholeskyMCSamplerMixin(MCSamplerMixin):
+    r"""Abstract Mixin class for acquisition functions using a cached Cholesky.
 
     Specifically, this is for acquisition functions that require sampling from
     the posterior P(f(X_baseline, X) | D). The Cholesky of the posterior
     covariance over f(X_baseline) is cached.
-
-    :meta private:
     """
 
-    def _setup(
+    def __init__(
         self,
         model: Model,
         cache_root: bool = False,
+        sampler: Optional[MCSampler] = None,
     ) -> None:
         r"""Set class attributes and perform compatibility checks.
 
@@ -79,7 +80,9 @@ class CachedCholeskyMCAcquisitionFunction(ABC):
             model: A model.
             cache_root: A boolean indicating whether to cache the Cholesky.
                 This might be overridden in the model is not compatible.
+            sampler: An optional MCSampler object.
         """
+        MCSamplerMixin.__init__(self, sampler=sampler)
         if cache_root and not supports_cache_root(model):
             warnings.warn(
                 _get_cache_root_not_supported_message(type(model)),
@@ -102,9 +105,9 @@ class CachedCholeskyMCAcquisitionFunction(ABC):
           `MultitaskMultivariateNormal`, since we construct `lazy_covar` in that
           case.
         2) If the root decomposition has not been found in the cache, compute it.
-        3) Write it to the cache of `lazy_covar`. Note that this will become inacessible
-          if `posterior.mvn` is a `MultitaskMultivariateNormal`, since in that case
-          `lazy_covar`'s scope is only this function.
+        3) Write it to the cache of `lazy_covar`. Note that this will become
+          inaccessible if `posterior.mvn` is a `MultitaskMultivariateNormal`,
+          since in that case `lazy_covar`'s scope is only this function.
 
         Args:
             posterior: The posterior over f(X_baseline).

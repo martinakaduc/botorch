@@ -17,6 +17,7 @@ from botorch.exceptions.errors import BotorchError
 from botorch.utils.constraints import get_monotonicity_constraints
 from botorch.utils.probability.lin_ess import LinearEllipticalSliceSampler
 from botorch.utils.testing import BotorchTestCase
+from linear_operator.operators import DiagLinearOperator
 from torch import Tensor
 
 
@@ -25,11 +26,11 @@ class TestLinearEllipticalSliceSampler(BotorchTestCase):
         for dtype in (torch.float, torch.double):
             tkwargs = {"device": self.device, "dtype": dtype}
             # test input validation
-            with self.assertRaises(BotorchError) as e:
+            with self.assertRaisesRegex(
+                BotorchError, "requires either inequality constraints or bounds"
+            ):
                 LinearEllipticalSliceSampler()
-                self.assertTrue(
-                    "requires either inequality constraints or bounds" in str(e)
-                )
+
             # special case: N(0, 1) truncated to negative numbers
             A = torch.ones(1, 1, **tkwargs)
             b = torch.zeros(1, 1, **tkwargs)
@@ -164,6 +165,20 @@ class TestLinearEllipticalSliceSampler(BotorchTestCase):
             self.assertEqual(samples.shape, torch.Size([3, 2]))
             self.assertTrue(sampler._is_feasible(samples.t()).all())
             self.assertFalse(torch.equal(sampler._x, sampler.x0))
+
+            # testing automatic unsqueezing
+            sampler = LinearEllipticalSliceSampler(
+                inequality_constraints=(A, b),
+                mean=mean.squeeze(-1),
+            )
+            self.assertEqual(sampler._mean.shape, mean.shape)
+
+            x0 = mean
+            sampler = LinearEllipticalSliceSampler(
+                inequality_constraints=(A, b),
+                interior_point=x0.squeeze(-1),
+            )
+            self.assertEqual(sampler.x0.shape, x0.shape)
 
     def test_multivariate(self):
         torch.manual_seed(torch.randint(100, torch.Size([])).item())
@@ -358,15 +373,12 @@ class TestLinearEllipticalSliceSampler(BotorchTestCase):
                 check_feasibility=True,
             )
             nu = torch.full((d, 1), lower_bound + 2, **tkwargs)
-            theta_active = sampler._find_active_intersections(nu)
-            self.assertTrue(
-                torch.equal(theta_active, sampler._full_angular_range.view(-1))
-            )
-            rot_angle, slices = sampler._find_rotated_intersections(nu)
-            self.assertEqual(rot_angle, 0.0)
-            self.assertAllClose(
-                slices, torch.tensor([[0.0, 2 * torch.pi]], **tkwargs), atol=atol
-            )
+
+            # Get the left and right endpoints of the active intervals.
+            # As the entire ellipse is feasible, the cumulative length should be 2 * pi.
+            left, right = sampler._find_active_intersection_angles(nu)
+            csum = (right - left).clamp(min=0.0).cumsum(dim=-1)
+            self.assertAllClose(csum[:, -1].item(), 2 * math.pi)
 
             # 2) testing tangential intersection of ellipse with constraint
             nu = torch.full((d, 1), lower_bound, **tkwargs)
@@ -375,10 +387,13 @@ class TestLinearEllipticalSliceSampler(BotorchTestCase):
                 inequality_constraints=(A, b),
                 check_feasibility=True,
             )
-            nu = torch.full((d, 1), lower_bound + 1, **tkwargs)
-            # nu[1] += 1
-            theta_active = sampler._find_active_intersections(nu)
-            self.assertTrue(theta_active.numel() % 2 == 0)
+            nu = torch.zeros((d, 1), **tkwargs)
+
+            # The ellipse is tangent to the domain, but it is still entirely contained
+            # in the domain. Therefore, the cumulative length should be 2 * pi.
+            left, right = sampler._find_active_intersection_angles(nu)
+            csum = right.sub(left).clamp(min=0.0).cumsum(dim=-1)
+            self.assertAllClose(csum[:, -1].item(), 2 * math.pi)
 
             # testing error message for infeasible sample
             sampler.check_feasibility = True
@@ -414,8 +429,23 @@ class TestLinearEllipticalSliceSampler(BotorchTestCase):
                     inequality_constraints=(A, b),
                     interior_point=interior_point,
                     fixed_indices=[0],
-                    covariance_root=torch.eye(d, **tkwargs),
+                    covariance_root=torch.full((d, d), 100, **tkwargs),
                 )
+
+            # providing a diagonal covariance_root should work with fixed indices
+            diag_root = torch.full((d,), 100, **tkwargs)
+            for covariance_root in [DiagLinearOperator(diag_root), diag_root.diag()]:
+                torch.manual_seed(1234)
+                sampler = LinearEllipticalSliceSampler(
+                    inequality_constraints=(A, b),
+                    interior_point=interior_point,
+                    fixed_indices=[0],
+                    covariance_root=covariance_root,
+                )
+                num_samples = 16
+                X_fixed = sampler.draw(n=num_samples)
+                self.assertTrue((X_fixed[:, 0] == interior_point[0]).all())
+                self.assertGreater(X_fixed.std().item(), 10.0)  # false if sigma = 1
 
             # high dimensional test case
             # Encodes order constraints on all d variables: Ax < b <-> x[i] < x[i + 1]
@@ -432,3 +462,45 @@ class TestLinearEllipticalSliceSampler(BotorchTestCase):
             self.assertEqual(X_high_d.shape, torch.Size([16, d]))
             self.assertTrue(sampler._is_feasible(X_high_d.T).all())
             self.assertEqual(sampler.lifetime_samples, num_samples)
+
+    def test_batch_mcmc(self):
+        # all random seeds in [0, 99] should pass
+        torch.manual_seed(torch.randint(100, (1,)))
+
+        d = 5
+
+        for dtype in (torch.float, torch.double):
+            tkwargs = {"device": self.device, "dtype": dtype}
+
+            # special case: N(0, I) truncated by a symmetric box
+            bounds = torch.cat(
+                [-1 * torch.ones(1, d, **tkwargs), torch.ones(1, d, **tkwargs)],
+                dim=0,
+            )
+
+            # Run a single Markov chain.
+            sampler = LinearEllipticalSliceSampler(
+                bounds=bounds,
+                check_feasibility=True,
+                burnin=50,
+            )
+            samples = sampler.draw(n=10)
+            self.assertEqual(samples.shape, torch.Size([10, d]))
+
+            # Run 50 Markov chains.
+            batch_sampler = LinearEllipticalSliceSampler(
+                bounds=bounds,
+                check_feasibility=True,
+                burnin=50,
+                num_chains=50,
+            )
+            batch_samples = batch_sampler.draw(n=10)
+            self.assertEqual(batch_samples.shape, torch.Size([50 * 10, d]))
+
+            # The ground truth mean is zero thanks to symmetry, and
+            # thus the norm of sample mean is the estimation error.
+            # Use more Markov chains should have strictly smaller error.
+            self.assertGreater(
+                samples.mean(dim=0).norm(),
+                batch_samples.mean(dim=0).norm(),
+            )

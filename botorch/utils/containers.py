@@ -25,9 +25,9 @@ class BotorchContainer(ABC):
 
     Notice: Once version 3.10 becomes standard, this class should
     be reworked to take advantage of dataclasses' `kw_only` flag.
-
-    :meta private:
     """
+
+    event_shape: Size
 
     def __post_init__(self, validate_init: bool = True) -> None:
         if validate_init:
@@ -66,6 +66,7 @@ class BotorchContainer(ABC):
 @dataclass(eq=False)
 class DenseContainer(BotorchContainer):
     r"""Basic representation of data stored as a dense Tensor."""
+
     values: Tensor
     event_shape: Size
 

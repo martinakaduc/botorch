@@ -5,12 +5,10 @@
 # LICENSE file in the root directory of this source tree.
 
 import itertools
-import warnings
 from copy import deepcopy
 from random import randint
 
 import torch
-from botorch import settings
 from botorch.exceptions.errors import BotorchTensorDimensionError
 from botorch.exceptions.warnings import UserInputWarning
 from botorch.models.transforms.input import (
@@ -229,8 +227,8 @@ class TestInputTransforms(BotorchTestCase):
             nlz.to(other_dtype)
             self.assertTrue(nlz.mins.dtype == other_dtype)
             # test incompatible dimensions of specified bounds
+            bounds = torch.zeros(2, 3, device=self.device, dtype=dtype)
             with self.assertRaises(BotorchTensorDimensionError):
-                bounds = torch.zeros(2, 3, device=self.device, dtype=dtype)
                 Normalize(d=2, bounds=bounds)
 
             # test jitter
@@ -380,7 +378,25 @@ class TestInputTransforms(BotorchTestCase):
                 self.assertIsNone(nlz.coefficient.grad_fn)
                 self.assertIsNone(nlz.offset.grad_fn)
 
-    def test_standardize(self):
+            # test that zero range is not scaled.
+            nlz = Normalize(d=2)
+            X = torch.tensor([[1.0, 0.0], [1.0, 2.0]], device=self.device, dtype=dtype)
+            nlzd_X = nlz(X)
+            self.assertAllClose(
+                nlz.coefficient,
+                torch.tensor([[1.0, 2.0]], device=self.device, dtype=dtype),
+            )
+            expected_X = torch.tensor(
+                [[1.0, 0.0], [1.0, 1.0]], device=self.device, dtype=dtype
+            )
+            self.assertAllClose(nlzd_X, expected_X)
+            nlz.eval()
+            X = torch.tensor([[1.5, 1.5]], device=self.device, dtype=dtype)
+            nlzd_X = nlz(X)
+            expected_X = torch.tensor([[1.5, 0.75]], device=self.device, dtype=dtype)
+            self.assertAllClose(nlzd_X, expected_X)
+
+    def test_standardize(self) -> None:
         for dtype in (torch.float, torch.double):
             # basic init
             stdz = InputStandardize(d=2)
@@ -527,7 +543,7 @@ class TestInputTransforms(BotorchTestCase):
                 stdz8 = InputStandardize(d=3, batch_shape=batch_shape, indices=[0, 2])
                 self.assertFalse(stdz7.equals(stdz8))
 
-    def test_chained_input_transform(self):
+    def test_chained_input_transform(self) -> None:
         ds = (1, 2)
         batch_shapes = (torch.Size(), torch.Size([2]))
         dtypes = (torch.float, torch.double)
@@ -602,10 +618,6 @@ class TestInputTransforms(BotorchTestCase):
         # basic init
         int_idcs = [0, 4]
         categorical_feats = {2: 2, 5: 3}
-        # test deprecation warning
-        with warnings.catch_warnings(record=True) as ws, settings.debug(True):
-            Round(indices=int_idcs)
-            self.assertTrue(any(issubclass(w.category, DeprecationWarning) for w in ws))
         round_tf = Round(
             integer_indices=int_idcs, categorical_features=categorical_feats
         )
@@ -982,18 +994,47 @@ class TestInputTransforms(BotorchTestCase):
             self.assertTrue((warp_tf.concentration1 == 3.0).all())
 
     def test_one_hot_to_numeric(self) -> None:
+        dim = 8
+        # test exceptions
+        categorical_features = {0: 2, 1: 3}
+        with self.assertRaises(ValueError, msg="Categorical features overlap."):
+            OneHotToNumeric(dim=dim, categorical_features=categorical_features)
+        dim = 3
+        categorical_features = {0: 6}
+        with self.assertRaises(
+            ValueError, msg="Categorical features exceed the provided dimension."
+        ):
+            OneHotToNumeric(dim=dim, categorical_features=categorical_features)
+
         # set seed to range where this is known to not be flaky
         torch.manual_seed(randint(0, 1000))
-        dim = 8
-        # test exception when categoricals are not the trailing dimensions
-        categorical_features = {0: 2}
-        with self.assertRaises(ValueError):
-            OneHotToNumeric(dim=dim, categorical_features=categorical_features)
-        # categoricals at start and end of X but not in between
-        categorical_features = {0: 3, 6: 2}
-        with self.assertRaises(ValueError):
-            OneHotToNumeric(dim=dim, categorical_features=categorical_features)
         for dtype in (torch.float, torch.double):
+            # only categoricals
+            dim = 5
+            categorical_features = {0: 3, 3: 2}
+            tf = OneHotToNumeric(dim=dim, categorical_features=categorical_features)
+            tf.eval()
+            self.assertEqual(tf.categorical_features, {0: 3, 3: 2})
+            cat1_numeric = torch.randint(0, 3, (3,), device=self.device)
+            cat1 = one_hot(cat1_numeric, num_classes=3)
+            cat2_numeric = torch.randint(0, 2, (3,), device=self.device)
+            cat2 = one_hot(cat2_numeric, num_classes=2)
+            X = torch.cat([cat1, cat2], dim=-1)
+            # test forward
+            X_numeric = tf(X)
+            expected = torch.cat(
+                [
+                    cat1_numeric.view(-1, 1).to(dtype=dtype, device=self.device),
+                    cat2_numeric.view(-1, 1).to(dtype=dtype, device=self.device),
+                ],
+                dim=-1,
+            )
+            self.assertTrue(torch.equal(X_numeric, expected))
+            X2 = tf.untransform(X_numeric)
+            self.assertTrue(torch.equal(X2, X))
+
+            # two categoricals at end
+            dim = 8
             categorical_features = {6: 2, 3: 3}
             tf = OneHotToNumeric(dim=dim, categorical_features=categorical_features)
             tf.eval()
@@ -1015,17 +1056,81 @@ class TestInputTransforms(BotorchTestCase):
                 dim=-1,
             )
             self.assertTrue(torch.equal(X_numeric, expected))
-
-            # test untransform
             X2 = tf.untransform(X_numeric)
             self.assertTrue(torch.equal(X2, X))
 
-            # test no
+            # three categoricals at end
+            dim = 10
+            categorical_features = {
+                6: 2,
+                3: 3,
+                8: 2,
+            }
+            tf = OneHotToNumeric(dim=dim, categorical_features=categorical_features)
+            tf.eval()
+            self.assertEqual(tf.categorical_features, {3: 3, 6: 2, 8: 2})
+            cat1_numeric = torch.randint(0, 3, (3,), device=self.device)
+            cat1 = one_hot(cat1_numeric, num_classes=3)
+            cat2_numeric = torch.randint(0, 2, (3,), device=self.device)
+            cat2 = one_hot(cat2_numeric, num_classes=2)
+            cat3_numeric = torch.randint(0, 2, (3,), device=self.device)
+            cat3 = one_hot(cat3_numeric, num_classes=2)
+            cont = torch.rand(3, 3, dtype=dtype, device=self.device)
+            X = torch.cat([cont, cat1, cat2, cat3], dim=-1)
+            # test forward
+            X_numeric = tf(X)
+            expected = torch.cat(
+                [
+                    cont,
+                    cat1_numeric.view(-1, 1).to(cont),
+                    cat2_numeric.view(-1, 1).to(cont),
+                    cat3_numeric.view(-1, 1).to(cont),
+                ],
+                dim=-1,
+            )
+            self.assertTrue(torch.equal(X_numeric, expected))
+            X2 = tf.untransform(X_numeric)
+            self.assertTrue(torch.equal(X2, X))
+
+            # three categoricals, one at start, two at end
+            dim = 10
+            categorical_features = {
+                0: 3,
+                6: 2,
+                8: 2,
+            }
+            tf = OneHotToNumeric(dim=dim, categorical_features=categorical_features)
+            tf.eval()
+            self.assertEqual(tf.categorical_features, {0: 3, 6: 2, 8: 2})
+            cat1_numeric = torch.randint(0, 3, (3,), device=self.device)
+            cat1 = one_hot(cat1_numeric, num_classes=3)
+            cat2_numeric = torch.randint(0, 2, (3,), device=self.device)
+            cat2 = one_hot(cat2_numeric, num_classes=2)
+            cat3_numeric = torch.randint(0, 2, (3,), device=self.device)
+            cat3 = one_hot(cat3_numeric, num_classes=2)
+            cont = torch.rand(3, 3, dtype=dtype, device=self.device)
+            X = torch.cat([cat1, cont, cat2, cat3], dim=-1)
+            # test forward
+            X_numeric = tf(X)
+            expected = torch.cat(
+                [
+                    cat1_numeric.view(-1, 1).to(cont),
+                    cont,
+                    cat2_numeric.view(-1, 1).to(cont),
+                    cat3_numeric.view(-1, 1).to(cont),
+                ],
+                dim=-1,
+            )
+            self.assertTrue(torch.equal(X_numeric, expected))
+            X2 = tf.untransform(X_numeric)
+            self.assertTrue(torch.equal(X2, X))
+
+            # test no categorical features.
             tf = OneHotToNumeric(dim=dim, categorical_features={})
             tf.eval()
             X_tf = tf(X)
             self.assertTrue(torch.equal(X, X_tf))
-            X2 = tf(X_tf)
+            X2 = tf.untransform(X_tf)
             self.assertTrue(torch.equal(X2, X_tf))
 
         # test no transform on eval
@@ -1064,7 +1169,7 @@ class TestInputTransforms(BotorchTestCase):
 
 
 class TestAppendFeatures(BotorchTestCase):
-    def test_append_features(self):
+    def test_append_features(self) -> None:
         with self.assertRaises(ValueError):
             AppendFeatures(torch.ones(1))
         with self.assertRaises(ValueError):
@@ -1105,7 +1210,7 @@ class TestAppendFeatures(BotorchTestCase):
             self.assertEqual(transform.feature_set.device.type, "cpu")
             self.assertEqual(transform.feature_set.dtype, torch.half)
 
-    def test_w_skip_expand(self):
+    def test_w_skip_expand(self) -> None:
         for dtype in (torch.float, torch.double):
             tkwargs = {"device": self.device, "dtype": dtype}
             feature_set = torch.tensor([[0.0], [1.0]], **tkwargs)
@@ -1128,7 +1233,7 @@ class TestAppendFeatures(BotorchTestCase):
             tf_X = append_tf(pert_tf(test_X.expand(3, 5, -1, -1)))
             self.assertAllClose(tf_X, expected_X.expand(3, 5, -1, -1))
 
-    def test_w_f(self):
+    def test_w_f(self) -> None:
         def f1(x: Tensor, n_f: int = 1) -> Tensor:
             result = torch.sum(x, dim=-1, keepdim=True).unsqueeze(-2)
             return result.expand(*result.shape[:-2], n_f, -1)
@@ -1360,7 +1465,7 @@ class TestAppendFeatures(BotorchTestCase):
 
 
 class TestFilterFeatures(BotorchTestCase):
-    def test_filter_features(self):
+    def test_filter_features(self) -> None:
         with self.assertRaises(ValueError):
             FilterFeatures(torch.tensor([[1, 2]], dtype=torch.long))
         with self.assertRaises(ValueError):
@@ -1434,7 +1539,7 @@ class TestFilterFeatures(BotorchTestCase):
 
 
 class TestInputPerturbation(BotorchTestCase):
-    def test_input_perturbation(self):
+    def test_input_perturbation(self) -> None:
         with self.assertRaisesRegex(ValueError, "-dim tensor!"):
             InputPerturbation(torch.ones(1))
         with self.assertRaisesRegex(ValueError, "-dim tensor!"):

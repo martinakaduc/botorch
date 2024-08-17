@@ -39,6 +39,10 @@
       "title": "High-dimensional Bayesian optimization with SAASBO"
     },
     {
+      "id": "cost_aware_bayesian_optimization",
+      "title": "Cost-aware Bayesian optimization"
+    },
+    {
       "id": "Multi_objective_multi_fidelity_BO",
       "title": "Multi-Objective-Multi-Fidelity optimization with MOMF"
     },
@@ -49,6 +53,10 @@
     {
       "id": "thompson_sampling",
       "title": "Bayesian optimization with large-scale Thompson sampling"
+    },
+    {
+      "id": "ibnn_bo",
+      "title": "Bayesian optimization with infinite-width neural networks"
     }
   ],
   "Multi-Objective Bayesian Optimization": [
@@ -63,6 +71,10 @@
     {
       "id": "robust_multi_objective_bo",
       "title": "Robust multi-objective Bayesian optimization under input noise"
+    },
+    {
+      "id": "decoupled_mobo",
+      "title": "Multi-objective Bayesian optimization with decoupled evaluations"
     }
   ],
   "Bite-Sized Tutorials": [

@@ -10,8 +10,8 @@ from unittest import mock
 
 import torch
 from botorch.acquisition.multi_objective.objective import (
+    IdentityMCMultiOutputObjective,
     MCMultiOutputObjective,
-    UnstandardizeMCMultiOutputObjective,
 )
 from botorch.acquisition.multi_objective.utils import (
     compute_sample_box_decomposition,
@@ -24,7 +24,7 @@ from botorch.exceptions.errors import UnsupportedError
 from botorch.models.gp_regression import SingleTaskGP
 from botorch.models.model_list_gp_regression import ModelListGP
 from botorch.models.transforms.outcome import Standardize
-from botorch.utils.gp_sampling import get_gp_samples
+from botorch.sampling.pathwise import get_matheron_path_model
 from botorch.utils.multi_objective import is_non_dominated
 from botorch.utils.testing import BotorchTestCase, MockModel, MockPosterior
 from torch import Tensor
@@ -88,20 +88,17 @@ class TestMultiObjectiveUtils(BotorchTestCase):
                 prune_inferior_points_multi_objective(
                     model=mm, X=X, max_frac=1.1, ref_point=ref_point
                 )
+            # test that invalid X is checked properly
+            with self.assertRaises(ValueError):
+                prune_inferior_points_multi_objective(
+                    model=mm, X=torch.empty(0, 0), ref_point=ref_point
+                )
             # test basic behaviour
             X_pruned = prune_inferior_points_multi_objective(
                 model=mm, X=X, ref_point=ref_point
             )
-            self.assertTrue(torch.equal(X_pruned, X[[-1]]))
-            # test unstd objective
-            unstd_obj = UnstandardizeMCMultiOutputObjective(
-                Y_mean=samples.mean(dim=0), Y_std=samples.std(dim=0), outcomes=[0, 1]
-            )
-            X_pruned = prune_inferior_points_multi_objective(
-                model=mm, X=X, ref_point=ref_point, objective=unstd_obj
-            )
-            self.assertTrue(torch.equal(X_pruned, X[[-1]]))
             # test constraints
+            objective = IdentityMCMultiOutputObjective(outcomes=[0, 1])
             samples_constrained = torch.tensor(
                 [[1.0, 2.0, -1.0], [2.0, 1.0, -1.0], [3.0, 4.0, 1.0]], **tkwargs
             )
@@ -110,7 +107,7 @@ class TestMultiObjectiveUtils(BotorchTestCase):
                 model=mm_constrained,
                 X=X,
                 ref_point=ref_point,
-                objective=unstd_obj,
+                objective=objective,
                 constraints=[lambda Y: Y[..., -1]],
             )
             self.assertTrue(torch.equal(X_pruned, X[:2]))
@@ -161,7 +158,7 @@ class TestMultiObjectiveUtils(BotorchTestCase):
                 model=mm,
                 X=X,
                 ref_point=ref_point,
-                objective=unstd_obj,
+                objective=objective,
                 constraints=[lambda Y: Y[..., -1] - 3.0],
                 marginalize_dim=-3,
             )
@@ -309,11 +306,7 @@ class TestThompsonSampling(BotorchTestCase):
                 **tkwargs,
             )
 
-            model_sample = get_gp_samples(
-                model=model,
-                num_outputs=num_objectives,
-                n_samples=1,
-            )
+            model_sample = get_matheron_path_model(model=model)
 
             input_dim = X.shape[-1]
             # fake bounds

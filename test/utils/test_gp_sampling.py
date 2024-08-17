@@ -12,7 +12,7 @@ import torch
 from botorch.models.converter import batched_to_model_list
 from botorch.models.deterministic import DeterministicModel
 from botorch.models.fully_bayesian import SaasFullyBayesianSingleTaskGP
-from botorch.models.gp_regression import FixedNoiseGP, SingleTaskGP
+from botorch.models.gp_regression import SingleTaskGP
 from botorch.models.model import ModelList
 from botorch.models.multitask import MultiTaskGP
 from botorch.models.transforms.input import Normalize
@@ -27,7 +27,7 @@ from botorch.utils.gp_sampling import (
     RandomFourierFeatures,
 )
 from botorch.utils.testing import BotorchTestCase
-from botorch.utils.transforms import is_fully_bayesian
+from botorch.utils.transforms import is_ensemble
 from gpytorch.kernels import MaternKernel, PeriodicKernel, RBFKernel, ScaleKernel
 from torch.distributions import MultivariateNormal
 
@@ -190,7 +190,10 @@ class TestGPDraw(BotorchTestCase):
             tkwargs = {"device": self.device, "dtype": dtype}
             model, _, _ = _get_model(**tkwargs)
             mean = model.mean_module.raw_constant.detach().clone()
-            gp = GPDraw(model)
+            with self.assertWarnsRegex(
+                DeprecationWarning, "is deprecated and will be removed"
+            ):
+                gp = GPDraw(model)
             # test initialization
             self.assertIsNone(gp.Xs)
             self.assertIsNone(gp.Ys)
@@ -547,23 +550,30 @@ class TestRandomFourierFeatures(BotorchTestCase):
                 )
                 with torch.random.fork_rng():
                     torch.manual_seed(0)
-                    gp_samples = get_gp_samples(
-                        model=batched_to_model_list(model)
-                        if ((not use_batch_model) and (m > 1))
-                        else model,
-                        num_outputs=m,
-                        n_samples=n_samples,
-                        num_rff_features=512,
-                    )
+                    with self.assertWarnsRegex(
+                        DeprecationWarning, "is deprecated and will be removed"
+                    ):
+                        gp_samples = get_gp_samples(
+                            model=(
+                                batched_to_model_list(model)
+                                if ((not use_batch_model) and (m > 1))
+                                else model
+                            ),
+                            num_outputs=m,
+                            n_samples=n_samples,
+                            num_rff_features=512,
+                        )
                 samples = gp_samples.posterior(X).mean
                 self.assertEqual(samples.shape[0], n_samples)
                 if batched_inputs:
                     self.assertEqual(samples.shape[1], 2)
                 self.assertIsInstance(
                     gp_samples,
-                    ModelList
-                    if ((not use_batch_model) and (m > 1))
-                    else DeterministicModel,
+                    (
+                        ModelList
+                        if ((not use_batch_model) and (m > 1))
+                        else DeterministicModel
+                    ),
                 )
                 Y_hat_rff = samples.mean(dim=0)
                 with torch.no_grad():
@@ -621,9 +631,11 @@ class TestRandomFourierFeatures(BotorchTestCase):
                     torch.manual_seed(28)
                     for _ in range(10):
                         gp_samples = get_gp_samples(
-                            model=batched_to_model_list(model)
-                            if ((not use_batch_model) and (m > 1))
-                            else model,
+                            model=(
+                                batched_to_model_list(model)
+                                if ((not use_batch_model) and (m > 1))
+                                else model
+                            ),
                             num_outputs=m,
                             n_samples=1,
                             num_rff_features=512,
@@ -632,9 +644,11 @@ class TestRandomFourierFeatures(BotorchTestCase):
                             means.append(model.posterior(X).mean)
                 samples = gp_samples.posterior(X).mean
                 self.assertEqual(samples.shape[:-1], X.shape[:-1])
-                self.assertIsInstance(gp_samples, ModelList) if (
-                    (not use_batch_model) and (m > 1)
-                ) else DeterministicModel
+                (
+                    self.assertIsInstance(gp_samples, ModelList)
+                    if ((not use_batch_model) and (m > 1))
+                    else DeterministicModel
+                )
                 Y_hat_rff = torch.stack(means, dim=0).mean(dim=0)
                 with torch.no_grad():
                     Y_hat = model.posterior(X).mean
@@ -652,7 +666,7 @@ class TestRandomFourierFeatures(BotorchTestCase):
     def test_with_fixed_noise(self):
         for n_samples in (1, 20):
             gp_samples = get_gp_samples(
-                model=FixedNoiseGP(
+                model=SingleTaskGP(
                     torch.rand(5, 3, dtype=torch.double),
                     torch.randn(5, 1, dtype=torch.double),
                     torch.rand(5, 1, dtype=torch.double) * 0.1,
@@ -686,7 +700,7 @@ class TestRandomFourierFeatures(BotorchTestCase):
             num_outputs=1,
             n_samples=1,
         )
-        self.assertTrue(is_fully_bayesian(gp_samples))
+        self.assertTrue(is_ensemble(gp_samples))
         # Non-batch evaluation.
         samples = gp_samples(torch.rand(2, 4, **tkwargs))
         self.assertEqual(samples.shape, torch.Size([4, 2, 1]))

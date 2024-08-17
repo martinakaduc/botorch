@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from abc import abstractmethod
 from math import pi
-from typing import Any, Optional, Tuple, Union
+from typing import Optional, Union
 
 import torch
 from botorch import settings
@@ -50,7 +50,6 @@ class LowerBoundMultiObjectiveEntropySearch(AcquisitionFunction, MCSamplerMixin)
         X_pending: Optional[Tensor] = None,
         estimation_type: str = "LB",
         num_samples: int = 64,
-        **kwargs: Any,
     ) -> None:
         r"""Lower bound multi-objective entropy search acquisition function.
 
@@ -155,7 +154,7 @@ class LowerBoundMultiObjectiveEntropySearch(AcquisitionFunction, MCSamplerMixin)
     @abstractmethod
     def _compute_monte_carlo_variables(
         self, posterior: GPyTorchPosterior
-    ) -> Tuple[Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor]:
         r"""Compute the samples and log-probability associated with a posterior
         distribution.
 
@@ -283,7 +282,6 @@ class qLowerBoundMultiObjectiveJointEntropySearch(
         X_pending: Optional[Tensor] = None,
         estimation_type: str = "LB",
         num_samples: int = 64,
-        **kwargs: Any,
     ) -> None:
         r"""Lower bound multi-objective joint entropy search acquisition function.
 
@@ -408,7 +406,7 @@ class qLowerBoundMultiObjectiveJointEntropySearch(
 
     def _compute_monte_carlo_variables(
         self, posterior: GPyTorchPosterior
-    ) -> Tuple[Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor]:
         r"""Compute the samples and log-probability associated with the posterior
         distribution that conditions on the Pareto optimal points.
 

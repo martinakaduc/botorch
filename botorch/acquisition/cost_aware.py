@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import warnings
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Optional, Union
+from typing import Callable, Optional, Union
 
 import torch
 from botorch import settings
@@ -31,14 +31,12 @@ from torch.nn import Module
 
 
 class CostAwareUtility(Module, ABC):
-    r"""
-    Abstract base class for cost-aware utilities.
-
-    :meta private:
-    """
+    """Abstract base class for cost-aware utilities."""
 
     @abstractmethod
-    def forward(self, X: Tensor, deltas: Tensor, **kwargs: Any) -> Tensor:
+    def forward(
+        self, X: Tensor, deltas: Tensor, sampler: Optional[MCSampler] = None
+    ) -> Tensor:
         r"""Evaluate the cost-aware utility on the candidates and improvements.
 
         Args:
@@ -47,11 +45,12 @@ class CostAwareUtility(Module, ABC):
             deltas: A `num_fantasies x batch_shape`-dim Tensor of `num_fantasy`
                 samples from the marginal improvement in utility over the
                 current state at `X` for each t-batch.
+            sampler: A sampler used for sampling from the posterior of the cost
+                model. Some subclasses ignore this argument.
 
         Returns:
             A `num_fantasies x batch_shape`-dim Tensor of cost-transformed utilities.
         """
-        pass  # pragma: no cover
 
 
 class GenericCostAwareUtility(CostAwareUtility):
@@ -67,7 +66,9 @@ class GenericCostAwareUtility(CostAwareUtility):
         super().__init__()
         self._cost_callable: Callable[[Tensor, Tensor], Tensor] = cost
 
-    def forward(self, X: Tensor, deltas: Tensor, **kwargs: Any) -> Tensor:
+    def forward(
+        self, X: Tensor, deltas: Tensor, sampler: Optional[MCSampler] = None
+    ) -> Tensor:
         r"""Evaluate the cost function on the candidates and improvements.
 
         Args:
@@ -76,6 +77,7 @@ class GenericCostAwareUtility(CostAwareUtility):
             deltas: A `num_fantasies x batch_shape`-dim Tensor of `num_fantasy`
                 samples from the marginal improvement in utility over the
                 current state at `X` for each t-batch.
+            sampler: Ignored.
 
         Returns:
             A `num_fantasies x batch_shape`-dim Tensor of cost-weighted utilities.
@@ -94,6 +96,14 @@ class InverseCostWeightedUtility(CostAwareUtility):
     performs the inverse weighting on the sample level:
     `weighted utility = mean(u_1 / c_1, ..., u_N / c_N)`.
 
+    Where values in (u_1, ..., u_N) are negative, or for mean(U) < 0, the
+    weighted utility is instead calculated via scaling by the cost, i.e. if
+    `use_mean=True`: `weighted_utility = mean(U) * mean_cost` and if
+    `use_mean=False`:
+    `weighted utility = mean(u_1 * c_1, u_2 / c_2, u_3 * c_3, ..., u_N / c_N)`,
+    depending on whether (`u_*` >= 0), as with `u_2` and `u_N` in this case, or
+    (`u_*` < 0) as with `u_1` and `u_3`.
+
     The cost is additive across multiple elements of a q-batch.
     """
 
@@ -104,7 +114,9 @@ class InverseCostWeightedUtility(CostAwareUtility):
         cost_objective: Optional[MCAcquisitionObjective] = None,
         min_cost: float = 1e-2,
     ) -> None:
-        r"""Cost-aware utility that weights increase in utiltiy by inverse cost.
+        r"""Cost-aware utility that weights increase in utility by inverse cost.
+        For negative increases in utility, the utility is instead scaled by the
+        cost. See the class description for more information.
 
         Args:
             cost_model: A model of the cost of evaluating a candidate
@@ -122,7 +134,7 @@ class InverseCostWeightedUtility(CostAwareUtility):
             min_cost: A value used to clamp the cost samples so that they are not
                 too close to zero, which may cause numerical issues.
         Returns:
-            The inverse-cost-weighted utiltiy.
+            The inverse-cost-weighted utility.
         """
         super().__init__()
         if cost_objective is None:
@@ -133,7 +145,7 @@ class InverseCostWeightedUtility(CostAwareUtility):
                 cost_objective = GenericMCObjective(lambda Y, X: Y.sum(dim=-1))
 
         self.cost_model = cost_model
-        self.cost_objective = cost_objective
+        self.cost_objective: MCAcquisitionObjective = cost_objective
         self._use_mean = use_mean
         self._min_cost = min_cost
 
@@ -143,9 +155,10 @@ class InverseCostWeightedUtility(CostAwareUtility):
         deltas: Tensor,
         sampler: Optional[MCSampler] = None,
         X_evaluation_mask: Optional[Tensor] = None,
-        **kwargs: Any,
     ) -> Tensor:
-        r"""Evaluate the cost function on the candidates and improvements.
+        r"""Evaluate the cost function on the candidates and improvements. Note
+        that negative values of `deltas` are instead scaled by the cost, and not
+        inverse-weighted. See the class description for more information.
 
         Args:
             X: A `batch_shape x q x d`-dim Tensor of with `q` `d`-dim design
@@ -166,10 +179,10 @@ class InverseCostWeightedUtility(CostAwareUtility):
         if X_evaluation_mask is not None:
             # TODO: support different evaluation masks for each X. This requires
             # either passing evaluation_mask to `cost_model.posterior`
-            # or assuming that evalauting `cost_model.posterior(X)` on all
+            # or assuming that evaluating `cost_model.posterior(X)` on all
             # `q` points and then only selecting the costs for relevant points
             # does not change the cost function for each point. This would not be
-            # true for instance if the incremental cost of evalauting an additional
+            # true for instance if the incremental cost of evaluating an additional
             # point decreased as the number of points increased.
             if not all(
                 torch.equal(X_evaluation_mask[0], X_evaluation_mask[i])
@@ -201,10 +214,7 @@ class InverseCostWeightedUtility(CostAwareUtility):
         # this will be of shape `num_fantasies x batch_shape` or `batch_shape`
         cost = cost.clamp_min(self._min_cost).sum(dim=-1)
 
-        # if we are doing inverse weighting on the sample level, clamp numerator.
-        if not self._use_mean:
-            deltas = deltas.clamp_min(0.0)
-
         # compute and return the ratio on the sample level - If `use_mean=True`
-        # this operation involves broadcasting the cost across fantasies
-        return deltas / cost
+        # this operation involves broadcasting the cost across fantasies.
+        # We multiply by the cost if the deltas are <= 0, see discussion #2914
+        return torch.where(deltas > 0, deltas / cost, deltas * cost)

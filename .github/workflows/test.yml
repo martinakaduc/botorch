@@ -7,39 +7,14 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
-# TODO: Revert to PyTorch nightly after Pyro supports PyTorch 2.0
-# TODO: Also, revert the corresponding change in requirements.txt
 jobs:
 
   tests-and-coverage-pip:
-    name: Tests and coverage (pip, Python ${{ matrix.python-version }}, ${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: ["ubuntu-latest", "macos-latest", "windows-latest"]
-        python-version: ["3.9", "3.11"]
-    steps:
-    - uses: actions/checkout@v3
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v4
-      with:
-        python-version: ${{ matrix.python-version }}
-    - name: Install dependencies
-      env:
-        ALLOW_LATEST_GPYTORCH_LINOP: true
-      run: |
-        pip install torch torchvision
-        pip install git+https://github.com/cornellius-gp/linear_operator.git
-        pip install git+https://github.com/cornellius-gp/gpytorch.git
-        pip install .[test]
-    - name: Unit tests and coverage
-      run: |
-        pytest -ra --cov=. --cov-report term-missing
-    - name: Upload coverage
-      if: ${{ runner.os == 'Linux' && matrix.python-version == 3.9 }}
-      run: |
-        bash <(curl -s https://codecov.io/bash)
+    name: Test & Coverage (pip)
+    uses: ./.github/workflows/reusable_test_pip.yml
+    with:
+      use_latest_pytorch_gpytorch: true
+    secrets: inherit
 
   tests-conda:
     name: Tests (conda, ${{ matrix.os }})
@@ -47,11 +22,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: ["ubuntu-latest", "macos-latest", "windows-latest"]
-        python-version: ["3.9", "3.11"]
+        os: ["ubuntu-latest", "macos-14", "windows-latest"]
+        python-version: ["3.10", "3.12"]
     steps:
-    - uses: actions/checkout@v3
-    - uses: conda-incubator/setup-miniconda@v2
+    - uses: actions/checkout@v4
+    - uses: conda-incubator/setup-miniconda@v3
       with:
         miniconda-version: "latest"
         activate-environment: test
@@ -61,12 +36,18 @@ jobs:
       env:
         ALLOW_LATEST_GPYTORCH_LINOP: true
       run: |
+        # avoid conda bug in >=23.10.0: https://github.com/conda/conda/issues/13412
+        conda config --set solver classic
         conda install pytorch torchvision -c pytorch
         conda install -y pip scipy sphinx pytest flake8
         pip install git+https://github.com/cornellius-gp/linear_operator.git
         pip install git+https://github.com/cornellius-gp/gpytorch.git
         pip install .[test]
-    - name: Unit tests
+    - name: Unit tests -- BoTorch
       shell: bash -l {0}
       run: |
-        pytest -ra
+        pytest -ra test/
+    - name: Unit tests -- BoTorch Community
+      shell: bash -l {0}
+      run: |
+        pytest -ra test_community/

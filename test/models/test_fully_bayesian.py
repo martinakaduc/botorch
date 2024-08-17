@@ -7,11 +7,12 @@
 
 import itertools
 from unittest import mock
+from unittest.mock import patch
 
 import pyro
 
 import torch
-from botorch import fit_fully_bayesian_model_nuts
+from botorch import fit_fully_bayesian_model_nuts, utils
 from botorch.acquisition.analytic import (
     ExpectedImprovement,
     PosteriorMean,
@@ -34,6 +35,10 @@ from botorch.acquisition.multi_objective import (
     qExpectedHypervolumeImprovement,
     qNoisyExpectedHypervolumeImprovement,
 )
+from botorch.acquisition.multi_objective.logei import (
+    qLogExpectedHypervolumeImprovement,
+    qLogNoisyExpectedHypervolumeImprovement,
+)
 from botorch.acquisition.utils import prune_inferior_points
 from botorch.models import ModelList, ModelListGP
 from botorch.models.deterministic import GenericDeterministicModel
@@ -45,12 +50,17 @@ from botorch.models.fully_bayesian import (
     SaasPyroModel,
 )
 from botorch.models.transforms import Normalize, Standardize
-from botorch.posteriors.fully_bayesian import batched_bisect, FullyBayesianPosterior
+from botorch.posteriors.fully_bayesian import (
+    batched_bisect,
+    FullyBayesianPosterior,
+    GaussianMixturePosterior,
+)
 from botorch.sampling.get_sampler import get_sampler
-from botorch.utils.datasets import FixedNoiseDataset, SupervisedDataset
+from botorch.utils.datasets import SupervisedDataset
 from botorch.utils.multi_objective.box_decompositions.non_dominated import (
     NondominatedPartitioning,
 )
+from botorch.utils.safe_math import logmeanexp
 from botorch.utils.testing import BotorchTestCase
 from gpytorch.distributions import MultivariateNormal
 from gpytorch.kernels import MaternKernel, ScaleKernel
@@ -117,6 +127,18 @@ class TestFullyBayesianSingleTaskGP(BotorchTestCase):
                 None if infer_noise else 0.1 * torch.arange(10, **tkwargs).unsqueeze(-1)
             )
         return train_X, train_Y, train_Yvar, test_X
+
+    def _get_unnormalized_condition_data(
+        self, num_models: int, num_cond: int, infer_noise: bool, **tkwargs
+    ):
+        with torch.random.fork_rng():
+            torch.manual_seed(0)
+            cond_X = 5 + 5 * torch.rand(num_models, num_cond, 4, **tkwargs)
+            cond_Y = 10 + torch.sin(cond_X[..., :1])
+            cond_Yvar = (
+                None if infer_noise else 0.1 * torch.ones(cond_Y.shape, **tkwargs)
+            )
+        return cond_X, cond_Y, cond_Yvar
 
     def _get_mcmc_samples(
         self, num_samples: int, dim: int, infer_noise: bool, **tkwargs
@@ -240,7 +262,7 @@ class TestFullyBayesianSingleTaskGP(BotorchTestCase):
             for batch_shape in [[5], [6, 5, 2]]:
                 test_X = torch.rand(*batch_shape, d, **tkwargs)
                 posterior = model.posterior(test_X)
-                self.assertIsInstance(posterior, FullyBayesianPosterior)
+                self.assertIsInstance(posterior, GaussianMixturePosterior)
                 # Mean/variance
                 expected_shape = (
                     *batch_shape[: MCMC_DIM + 2],
@@ -252,14 +274,20 @@ class TestFullyBayesianSingleTaskGP(BotorchTestCase):
                 mean, var = posterior.mean, posterior.variance
                 self.assertEqual(mean.shape, expected_shape)
                 self.assertEqual(var.shape, expected_shape)
-                # Mixture mean/variance/median/quantiles
+                # Mixture mean/variance/covariance/median/quantiles
                 mixture_mean = posterior.mixture_mean
                 mixture_variance = posterior.mixture_variance
+                mixture_covariance = posterior.mixture_covariance_matrix
                 quantile1 = posterior.quantile(value=torch.tensor(0.01))
                 quantile2 = posterior.quantile(value=torch.tensor(0.99))
                 self.assertEqual(mixture_mean.shape, torch.Size(batch_shape + [1]))
                 self.assertEqual(mixture_variance.shape, torch.Size(batch_shape + [1]))
                 self.assertTrue(mixture_variance.min() > 0.0)
+                self.assertEqual(
+                    mixture_covariance.shape, torch.Size(batch_shape + batch_shape[-1:])
+                )
+                # Check that it is PSD.
+                torch.linalg.cholesky(mixture_covariance.to_dense())
                 self.assertEqual(quantile1.shape, torch.Size(batch_shape + [1]))
                 self.assertEqual(quantile2.shape, torch.Size(batch_shape + [1]))
                 self.assertTrue((quantile2 > quantile1).all())
@@ -359,6 +387,16 @@ class TestFullyBayesianSingleTaskGP(BotorchTestCase):
             self.assertIsNone(model.covar_module)
             self.assertIsNone(model.likelihood)
 
+    def test_empty(self):
+        model = SaasFullyBayesianSingleTaskGP(
+            train_X=torch.rand(0, 3),
+            train_Y=torch.rand(0, 1),
+        )
+        fit_fully_bayesian_model_nuts(
+            model, warmup_steps=2, num_samples=6, thinning=3, disable_progbar=True
+        )
+        self.assertEqual(model.covar_module.outputscale.shape, torch.Size([2]))
+
     def test_transforms(self):
         for infer_noise in [True, False]:
             tkwargs = {"device": self.device, "dtype": torch.double}
@@ -376,9 +414,9 @@ class TestFullyBayesianSingleTaskGP(BotorchTestCase):
                 gp1 = SaasFullyBayesianSingleTaskGP(
                     train_X=(train_X - lb) / (ub - lb),
                     train_Y=(train_Y - mu) / sigma,
-                    train_Yvar=train_Yvar / sigma**2
-                    if train_Yvar is not None
-                    else train_Yvar,
+                    train_Yvar=(
+                        train_Yvar / sigma**2 if train_Yvar is not None else train_Yvar
+                    ),
                 )
                 fit_fully_bayesian_model_nuts(
                     gp1, warmup_steps=8, num_samples=5, thinning=2, disable_progbar=True
@@ -438,13 +476,13 @@ class TestFullyBayesianSingleTaskGP(BotorchTestCase):
             qExpectedImprovement(
                 model=model, best_f=train_Y.max(), sampler=simple_sampler
             ),
-            qLogNoisyExpectedImprovement(
+            qNoisyExpectedImprovement(
                 model=model,
                 X_baseline=train_X,
                 sampler=simple_sampler,
                 cache_root=False,
             ),
-            qNoisyExpectedImprovement(
+            qLogNoisyExpectedImprovement(
                 model=model,
                 X_baseline=train_X,
                 sampler=simple_sampler,
@@ -462,7 +500,22 @@ class TestFullyBayesianSingleTaskGP(BotorchTestCase):
                 sampler=list_gp_sampler,
                 cache_root=False,
             ),
+            qLogNoisyExpectedHypervolumeImprovement(
+                model=list_gp,
+                X_baseline=train_X,
+                ref_point=torch.zeros(2, **tkwargs),
+                sampler=list_gp_sampler,
+                cache_root=False,
+            ),
             qExpectedHypervolumeImprovement(
+                model=list_gp,
+                ref_point=torch.zeros(2, **tkwargs),
+                sampler=list_gp_sampler,
+                partitioning=NondominatedPartitioning(
+                    ref_point=torch.zeros(2, **tkwargs), Y=train_Y.repeat([1, 2])
+                ),
+            ),
+            qLogExpectedHypervolumeImprovement(
                 model=list_gp,
                 ref_point=torch.zeros(2, **tkwargs),
                 sampler=list_gp_sampler,
@@ -478,7 +531,22 @@ class TestFullyBayesianSingleTaskGP(BotorchTestCase):
                 sampler=mixed_list_sampler,
                 cache_root=False,
             ),
+            qLogNoisyExpectedHypervolumeImprovement(
+                model=mixed_list,
+                X_baseline=train_X,
+                ref_point=torch.zeros(2, **tkwargs),
+                sampler=mixed_list_sampler,
+                cache_root=False,
+            ),
             qExpectedHypervolumeImprovement(
+                model=mixed_list,
+                ref_point=torch.zeros(2, **tkwargs),
+                sampler=mixed_list_sampler,
+                partitioning=NondominatedPartitioning(
+                    ref_point=torch.zeros(2, **tkwargs), Y=train_Y.repeat([1, 2])
+                ),
+            ),
+            qLogExpectedHypervolumeImprovement(
                 model=mixed_list,
                 ref_point=torch.zeros(2, **tkwargs),
                 sampler=mixed_list_sampler,
@@ -491,7 +559,16 @@ class TestFullyBayesianSingleTaskGP(BotorchTestCase):
         for acqf in acquisition_functions:
             for batch_shape in [[5], [6, 5, 2]]:
                 test_X = torch.rand(*batch_shape, 1, 4, **tkwargs)
-                self.assertEqual(acqf(test_X).shape, torch.Size(batch_shape))
+                # Testing that the t_batch_mode_transform works correctly for
+                # fully Bayesian models with log-space acquisition functions.
+                with patch.object(
+                    utils.transforms, "logmeanexp", wraps=logmeanexp
+                ) as mock:
+                    self.assertEqual(acqf(test_X).shape, torch.Size(batch_shape))
+                    if acqf._log:
+                        mock.assert_called_once()
+                    else:
+                        mock.assert_not_called()
 
         # Test prune_inferior_points
         X_pruned = prune_inferior_points(model=model, X=train_X)
@@ -550,10 +627,9 @@ class TestFullyBayesianSingleTaskGP(BotorchTestCase):
             X, Y, Yvar, model = self._get_data_and_model(
                 infer_noise=infer_noise, **tkwargs
             )
-            if infer_noise:
-                training_data = SupervisedDataset(X, Y)
-            else:
-                training_data = FixedNoiseDataset(X, Y, Yvar)
+            training_data = SupervisedDataset(
+                X, Y, Yvar=Yvar, feature_names=["1", "2", "3", "4"], outcome_names=["1"]
+            )
 
             data_dict = model.construct_inputs(training_data)
             self.assertTrue(X.equal(data_dict["train_X"]))
@@ -612,6 +688,119 @@ class TestFullyBayesianSingleTaskGP(BotorchTestCase):
                     atol=5e-4,
                 )
 
+    def test_condition_on_observation(self):
+        # The following conditioned data shapes should work (output describes):
+        # training data shape after cond(batch shape in output is req. in gpytorch)
+        # X: num_models x n x d, Y: num_models x n x d --> num_models x n x d
+        # X: n x d, Y: n x d --> num_models x n x d
+        # X: n x d, Y: num_models x n x d --> num_models x n x d
+        num_models = 3
+        num_cond = 2
+        for infer_noise, dtype in itertools.product(
+            (True, False), (torch.float, torch.double)
+        ):
+            tkwargs = {"device": self.device, "dtype": dtype}
+            train_X, train_Y, train_Yvar, test_X = self._get_unnormalized_data(
+                infer_noise=infer_noise, **tkwargs
+            )
+            num_train, num_dims = train_X.shape
+            # condition on different observations per model to obtain num_models sets
+            # of training data
+            cond_X, cond_Y, cond_Yvar = self._get_unnormalized_condition_data(
+                num_models=num_models,
+                num_cond=num_cond,
+                infer_noise=infer_noise,
+                **tkwargs
+            )
+            model = SaasFullyBayesianSingleTaskGP(
+                train_X=train_X,
+                train_Y=train_Y,
+                train_Yvar=train_Yvar,
+            )
+            mcmc_samples = self._get_mcmc_samples(
+                num_samples=num_models,
+                dim=train_X.shape[-1],
+                infer_noise=infer_noise,
+                **tkwargs
+            )
+            model.load_mcmc_samples(mcmc_samples)
+
+            # need to forward pass before conditioning
+            model.posterior(train_X)
+            cond_model = model.condition_on_observations(
+                cond_X, cond_Y, noise=cond_Yvar
+            )
+            posterior = cond_model.posterior(test_X)
+            self.assertEqual(
+                posterior.mean.shape, torch.Size([num_models, len(test_X), 1])
+            )
+
+            # since the data is not equal for the conditioned points, a batch size
+            # is added to the training data
+            self.assertEqual(
+                cond_model.train_inputs[0].shape,
+                torch.Size([num_models, num_train + num_cond, num_dims]),
+            )
+
+            # the batch shape of the condition model is added during conditioning
+            self.assertEqual(cond_model.batch_shape, torch.Size([num_models]))
+
+            # condition on identical sets of data (i.e. one set) for all models
+            # i.e, with no batch shape. This infers the batch shape.
+            cond_X_nobatch, cond_Y_nobatch = cond_X[0], cond_Y[0]
+            model = SaasFullyBayesianSingleTaskGP(
+                train_X=train_X,
+                train_Y=train_Y,
+                train_Yvar=train_Yvar,
+            )
+            mcmc_samples = self._get_mcmc_samples(
+                num_samples=num_models,
+                dim=train_X.shape[-1],
+                infer_noise=infer_noise,
+                **tkwargs
+            )
+            model.load_mcmc_samples(mcmc_samples)
+
+            # conditioning without a batch size - the resulting conditioned model
+            # will still have a batch size
+            model.posterior(train_X)
+            cond_model = model.condition_on_observations(
+                cond_X_nobatch, cond_Y_nobatch, noise=cond_Yvar
+            )
+            self.assertEqual(
+                cond_model.train_inputs[0].shape,
+                torch.Size([num_models, num_train + num_cond, num_dims]),
+            )
+
+            # With batch size only on Y.
+            cond_model = model.condition_on_observations(
+                cond_X_nobatch, cond_Y, noise=cond_Yvar
+            )
+            self.assertEqual(
+                cond_model.train_inputs[0].shape,
+                torch.Size([num_models, num_train + num_cond, num_dims]),
+            )
+
+            # test repeated conditining
+            repeat_cond_X = cond_X + 5
+            repeat_cond_model = cond_model.condition_on_observations(
+                repeat_cond_X, cond_Y, noise=cond_Yvar
+            )
+            self.assertEqual(
+                repeat_cond_model.train_inputs[0].shape,
+                torch.Size([num_models, num_train + 2 * num_cond, num_dims]),
+            )
+
+            # test repeated conditioning without a batch size
+            repeat_cond_X_nobatch = cond_X_nobatch + 10
+            repeat_cond_model2 = repeat_cond_model.condition_on_observations(
+                repeat_cond_X_nobatch, cond_Y_nobatch, noise=cond_Yvar
+            )
+            self.assertEqual(
+                repeat_cond_model2.train_inputs[0].shape,
+                torch.Size([num_models, num_train + 3 * num_cond, num_dims]),
+            )
+
     def test_bisect(self):
         def f(x):
             return 1 + x
@@ -645,7 +834,7 @@ class TestFullyBayesianSingleTaskGP(BotorchTestCase):
             variance = torch.rand(1, 5, **tkwargs)
             covar = torch.diag_embed(variance)
             mvn = MultivariateNormal(mean, to_linear_operator(covar))
-            posterior = FullyBayesianPosterior(distribution=mvn)
+            posterior = GaussianMixturePosterior(distribution=mvn)
             dist = torch.distributions.Normal(
                 loc=mean.unsqueeze(-1), scale=variance.unsqueeze(-1).sqrt()
             )
@@ -654,6 +843,17 @@ class TestFullyBayesianSingleTaskGP(BotorchTestCase):
                 self.assertAllClose(
                     dist.cdf(x), q * torch.ones(1, 5, 1, **tkwargs), atol=1e-4
                 )
+
+    def test_deprecated_posterior(self) -> None:
+        mean = torch.randn(1, 5)
+        variance = torch.rand(1, 5)
+        covar = torch.diag_embed(variance)
+        mvn = MultivariateNormal(mean, to_linear_operator(covar))
+        with self.assertWarnsRegex(
+            DeprecationWarning, "`FullyBayesianPosterior` is marked for deprecation"
+        ):
+            posterior = FullyBayesianPosterior(distribution=mvn)
+        self.assertIsInstance(posterior, GaussianMixturePosterior)
 
 
 class TestPyroCatchNumericalErrors(BotorchTestCase):

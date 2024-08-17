@@ -6,44 +6,18 @@
 from __future__ import annotations
 
 import math
-from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Callable, List, Optional, Union
+from typing import Callable, Optional, Union
 
 import torch
 from torch import Tensor
 from torch.nn import Parameter
 
 
-class HomotopySchedule(ABC):
-    @property
-    @abstractmethod
-    def num_steps(self) -> int:
-        """Number of steps in the schedule."""
-
-    @property
-    @abstractmethod
-    def value(self) -> Any:
-        """Current value in the schedule."""
-
-    @property
-    @abstractmethod
-    def should_stop(self) -> bool:
-        """Return true if we have incremented past the end of the schedule."""
-
-    @abstractmethod
-    def restart(self) -> None:
-        """Restart the schedule to start from the beginning."""
-
-    @abstractmethod
-    def step(self) -> None:
-        """Move to solving the next problem."""
-
-
-class FixedHomotopySchedule(HomotopySchedule):
+class FixedHomotopySchedule:
     """Homotopy schedule with a fixed list of values."""
 
-    def __init__(self, values: List[Any]) -> None:
+    def __init__(self, values: list[float]) -> None:
         r"""Initialize FixedHomotopySchedule.
 
         Args:
@@ -57,7 +31,7 @@ class FixedHomotopySchedule(HomotopySchedule):
         return len(self._values)
 
     @property
-    def value(self) -> Any:
+    def value(self) -> float:
         return self._values[self.idx]
 
     @property
@@ -112,8 +86,9 @@ class HomotopyParameter:
     The parameter is expected to either be a torch parameter or a torch tensor which may
     correspond to a buffer of a module. The parameter has a corresponding schedule.
     """
+
     parameter: Union[Parameter, Tensor]
-    schedule: HomotopySchedule
+    schedule: FixedHomotopySchedule
 
 
 class Homotopy:
@@ -128,8 +103,8 @@ class Homotopy:
 
     def __init__(
         self,
-        homotopy_parameters: List[HomotopyParameter],
-        callbacks: Optional[List[Callable]] = None,
+        homotopy_parameters: list[HomotopyParameter],
+        callbacks: Optional[list[Callable]] = None,
     ) -> None:
         r"""Initialize the homotopy.
 

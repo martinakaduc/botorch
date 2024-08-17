@@ -14,7 +14,7 @@ import dataclasses
 
 import warnings
 
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Optional, Union
 
 import torch
 from botorch.acquisition.acquisition import (
@@ -22,17 +22,20 @@ from botorch.acquisition.acquisition import (
     OneShotAcquisitionFunction,
 )
 from botorch.acquisition.knowledge_gradient import qKnowledgeGradient
+from botorch.acquisition.multi_objective.hypervolume_knowledge_gradient import (
+    qHypervolumeKnowledgeGradient,
+)
 from botorch.exceptions import InputDataError, UnsupportedError
 from botorch.exceptions.warnings import OptimizationWarning
 from botorch.generation.gen import gen_candidates_scipy, TGenCandidates
 from botorch.logging import logger
 from botorch.optim.initializers import (
     gen_batch_initial_conditions,
+    gen_one_shot_hvkg_initial_conditions,
     gen_one_shot_kg_initial_conditions,
     TGenInitialConditions,
 )
 from botorch.optim.stopping import ExpMAStoppingCriterion
-from botorch.optim.utils import _filter_kwargs
 from torch import Tensor
 
 INIT_OPTION_KEYS = {
@@ -66,11 +69,11 @@ class OptimizeAcqfInputs:
     q: int
     num_restarts: int
     raw_samples: Optional[int]
-    options: Optional[Dict[str, Union[bool, float, int, str]]]
-    inequality_constraints: Optional[List[Tuple[Tensor, Tensor, float]]]
-    equality_constraints: Optional[List[Tuple[Tensor, Tensor, float]]]
-    nonlinear_inequality_constraints: Optional[List[Callable]]
-    fixed_features: Optional[Dict[int, float]]
+    options: Optional[dict[str, Union[bool, float, int, str]]]
+    inequality_constraints: Optional[list[tuple[Tensor, Tensor, float]]]
+    equality_constraints: Optional[list[tuple[Tensor, Tensor, float]]]
+    nonlinear_inequality_constraints: Optional[list[tuple[Callable, bool]]]
+    fixed_features: Optional[dict[int, float]]
     post_processing_func: Optional[Callable[[Tensor], Tensor]]
     batch_initial_conditions: Optional[Tensor]
     return_best_only: bool
@@ -80,7 +83,7 @@ class OptimizeAcqfInputs:
     timeout_sec: Optional[float] = None
     return_full_tree: bool = False
     retry_on_optimization_warning: bool = True
-    ic_gen_kwargs: Dict = dataclasses.field(default_factory=dict)
+    ic_gen_kwargs: dict = dataclasses.field(default_factory=dict)
 
     @property
     def full_tree(self) -> bool:
@@ -129,34 +132,18 @@ class OptimizeAcqfInputs:
             return self.ic_generator
         elif isinstance(self.acq_function, qKnowledgeGradient):
             return gen_one_shot_kg_initial_conditions
+        elif isinstance(self.acq_function, qHypervolumeKnowledgeGradient):
+            return gen_one_shot_hvkg_initial_conditions
         return gen_batch_initial_conditions
-
-
-def _raise_deprecation_warning_if_kwargs(fn_name: str, kwargs: Dict[str, Any]) -> None:
-    """
-    Raise a warning if kwargs are provided.
-
-    Some functions used to support **kwargs. The applicable parameters have now been
-    refactored to be named arguments, so no warning will be raised for users passing
-    the expected arguments. However, if a user had been passing an inapplicable
-    keyword argument, this will now raise a warning whereas in the past it did
-    nothing.
-    """
-    if len(kwargs) > 0:
-        warnings.warn(
-            f"`{fn_name}` does not support arguments {list(kwargs.keys())}. In "
-            "the future, this will become an error.",
-            DeprecationWarning,
-        )
 
 
 def _optimize_acqf_all_features_fixed(
     *,
     bounds: Tensor,
-    fixed_features: Dict[int, float],
+    fixed_features: dict[int, float],
     q: int,
     acq_function: AcquisitionFunction,
-) -> Tuple[Tensor, Tensor]:
+) -> tuple[Tensor, Tensor]:
     """
     Helper function for `optimize_acqf` for the trivial case where
     all features are fixed.
@@ -214,9 +201,12 @@ def _validate_sequential_inputs(opt_inputs: OptimizeAcqfInputs) -> None:
 
 def _optimize_acqf_sequential_q(
     opt_inputs: OptimizeAcqfInputs,
-) -> Tuple[Tensor, Tensor]:
+) -> tuple[Tensor, Tensor]:
     """
     Helper function for `optimize_acqf` when sequential=True and q > 1.
+
+    For each of `q` times, generate a single candidate greedily, then add it to
+    the list of pending points.
     """
     _validate_sequential_inputs(opt_inputs)
     # When using sequential optimization, we allocate the total timeout
@@ -238,7 +228,6 @@ def _optimize_acqf_sequential_q(
         timeout_sec=timeout_sec,
     )
     for i in range(opt_inputs.q):
-
         candidate, acq_value = _optimize_acqf_batch(new_inputs)
 
         candidate_list.append(candidate)
@@ -254,7 +243,7 @@ def _optimize_acqf_sequential_q(
     return candidates, torch.stack(acq_value_list)
 
 
-def _optimize_acqf_batch(opt_inputs: OptimizeAcqfInputs) -> Tuple[Tensor, Tensor]:
+def _optimize_acqf_batch(opt_inputs: OptimizeAcqfInputs) -> tuple[Tensor, Tensor]:
     options = opt_inputs.options or {}
 
     initial_conditions_provided = opt_inputs.batch_initial_conditions is not None
@@ -278,14 +267,16 @@ def _optimize_acqf_batch(opt_inputs: OptimizeAcqfInputs) -> Tuple[Tensor, Tensor
 
     batch_limit: int = options.get(
         "batch_limit",
-        opt_inputs.num_restarts
-        if not opt_inputs.nonlinear_inequality_constraints
-        else 1,
+        (
+            opt_inputs.num_restarts
+            if not opt_inputs.nonlinear_inequality_constraints
+            else 1
+        ),
     )
 
-    def _optimize_batch_candidates() -> Tuple[Tensor, Tensor, List[Warning]]:
-        batch_candidates_list: List[Tensor] = []
-        batch_acq_values_list: List[Tensor] = []
+    def _optimize_batch_candidates() -> tuple[Tensor, Tensor, list[Warning]]:
+        batch_candidates_list: list[Tensor] = []
+        batch_acq_values_list: list[Tensor] = []
         batched_ics = batch_initial_conditions.split(batch_limit)
         opt_warnings = []
         timeout_sec = (
@@ -295,7 +286,7 @@ def _optimize_acqf_batch(opt_inputs: OptimizeAcqfInputs) -> Tuple[Tensor, Tensor
         )
 
         bounds = opt_inputs.bounds
-        gen_kwargs: Dict[str, Any] = {
+        gen_kwargs: dict[str, Any] = {
             "lower_bounds": None if bounds[0].isinf().all() else bounds[0],
             "upper_bounds": None if bounds[1].isinf().all() else bounds[1],
             "options": {k: v for k, v in options.items() if k not in INIT_OPTION_KEYS},
@@ -303,8 +294,6 @@ def _optimize_acqf_batch(opt_inputs: OptimizeAcqfInputs) -> Tuple[Tensor, Tensor
             "timeout_sec": timeout_sec,
         }
 
-        # only add parameter constraints to gen_kwargs if they are specified
-        # to avoid unnecessary warnings in _filter_kwargs
         for constraint_name in [
             "inequality_constraints",
             "equality_constraints",
@@ -312,8 +301,6 @@ def _optimize_acqf_batch(opt_inputs: OptimizeAcqfInputs) -> Tuple[Tensor, Tensor
         ]:
             if (constraint := getattr(opt_inputs, constraint_name)) is not None:
                 gen_kwargs[constraint_name] = constraint
-
-        filtered_gen_kwargs = _filter_kwargs(opt_inputs.gen_candidates, **gen_kwargs)
 
         for i, batched_ics_ in enumerate(batched_ics):
             # optimize using random restart optimization
@@ -323,7 +310,7 @@ def _optimize_acqf_batch(opt_inputs: OptimizeAcqfInputs) -> Tuple[Tensor, Tensor
                     batch_candidates_curr,
                     batch_acq_values_curr,
                 ) = opt_inputs.gen_candidates(
-                    batched_ics_, opt_inputs.acq_function, **filtered_gen_kwargs
+                    batched_ics_, opt_inputs.acq_function, **gen_kwargs
                 )
             opt_warnings += ws
             batch_candidates_list.append(batch_candidates_curr)
@@ -356,7 +343,7 @@ def _optimize_acqf_batch(opt_inputs: OptimizeAcqfInputs) -> Tuple[Tensor, Tensor
             f"warning(s):\n{[w.message for w in ws]}\nTrying again with a new "
             "set of initial conditions."
         )
-        warnings.warn(first_warn_msg, RuntimeWarning)
+        warnings.warn(first_warn_msg, RuntimeWarning, stacklevel=2)
 
         if not initial_conditions_provided:
             batch_initial_conditions = opt_inputs.get_ic_generator()(
@@ -382,6 +369,7 @@ def _optimize_acqf_batch(opt_inputs: OptimizeAcqfInputs) -> Tuple[Tensor, Tensor
                     "Optimization failed on the second try, after generating a "
                     "new set of initial conditions.",
                     RuntimeWarning,
+                    stacklevel=2,
                 )
 
     if opt_inputs.post_processing_func is not None:
@@ -412,11 +400,11 @@ def optimize_acqf(
     q: int,
     num_restarts: int,
     raw_samples: Optional[int] = None,
-    options: Optional[Dict[str, Union[bool, float, int, str]]] = None,
-    inequality_constraints: Optional[List[Tuple[Tensor, Tensor, float]]] = None,
-    equality_constraints: Optional[List[Tuple[Tensor, Tensor, float]]] = None,
-    nonlinear_inequality_constraints: Optional[List[Callable]] = None,
-    fixed_features: Optional[Dict[int, float]] = None,
+    options: Optional[dict[str, Union[bool, float, int, str]]] = None,
+    inequality_constraints: Optional[list[tuple[Tensor, Tensor, float]]] = None,
+    equality_constraints: Optional[list[tuple[Tensor, Tensor, float]]] = None,
+    nonlinear_inequality_constraints: Optional[list[tuple[Callable, bool]]] = None,
+    fixed_features: Optional[dict[int, float]] = None,
     post_processing_func: Optional[Callable[[Tensor], Tensor]] = None,
     batch_initial_conditions: Optional[Tensor] = None,
     return_best_only: bool = True,
@@ -428,7 +416,7 @@ def optimize_acqf(
     return_full_tree: bool = False,
     retry_on_optimization_warning: bool = True,
     **ic_gen_kwargs: Any,
-) -> Tuple[Tensor, Tensor]:
+) -> tuple[Tensor, Tensor]:
     r"""Generate a set of candidates via multi-start optimization.
 
     Args:
@@ -447,24 +435,32 @@ def optimize_acqf(
             `\sum_i (X[indices[i]] * coefficients[i]) >= rhs`. `indices` and
             `coefficients` should be torch tensors. See the docstring of
             `make_scipy_linear_constraints` for an example. When q=1, or when
-            applying the same constraint to each candidate in the batch,
-            `indices` should be a 1-d tensor. For inter-point constraints,
-            `indices` must be a 2-d Tensor, where in each row `indices[i] =
-            (k_i, l_i)` the first index `k_i` corresponds to the `k_i`-th
-            element of the `q`-batch and the second index `l_i` corresponds to
-            the `l_i`-th feature of that element.
+            applying the same constraint to each candidate in the batch
+            (intra-point constraint), `indices` should be a 1-d tensor.
+            For inter-point constraints, in which the constraint is applied to the
+            whole batch of candidates, `indices` must be a 2-d tensor, where
+            in each row `indices[i] =(k_i, l_i)` the first index `k_i` corresponds
+            to the `k_i`-th element of the `q`-batch and the second index `l_i`
+            corresponds to the `l_i`-th feature of that element.
         equality_constraints: A list of tuples (indices, coefficients, rhs),
             with each tuple encoding an equality constraint of the form
             `\sum_i (X[indices[i]] * coefficients[i]) = rhs`. See the docstring of
             `make_scipy_linear_constraints` for an example.
-        nonlinear_inequality_constraints: A list of callables with that represent
-            non-linear inequality constraints of the form `callable(x) >= 0`. Each
-            callable is expected to take a `(num_restarts) x q x d`-dim tensor as an
-            input and return a `(num_restarts) x q`-dim tensor with the constraint
-            values. The constraints will later be passed to SLSQP. You need to pass in
-            `batch_initial_conditions` in this case. Using non-linear inequality
-            constraints also requires that `batch_limit` is set to 1, which will be
-            done automatically if not specified in `options`.
+        nonlinear_inequality_constraints: A list of tuples representing the nonlinear
+            inequality constraints. The first element in the tuple is a callable
+            representing a constraint of the form `callable(x) >= 0`. In case of an
+            intra-point constraint, `callable()`takes in an one-dimensional tensor of
+            shape `d` and returns a scalar. In case of an inter-point constraint,
+            `callable()` takes a two dimensional tensor of shape `q x d` and again
+            returns a scalar. The second element is a boolean, indicating if it is an
+            intra-point or inter-point constraint (`True` for intra-point. `False` for
+            inter-point). For more information on intra-point vs inter-point
+            constraints, see the docstring of the `inequality_constraints` argument to
+            `optimize_acqf()`. The constraints will later be passed to the scipy
+            solver. You need to pass in `batch_initial_conditions` in this case.
+            Using non-linear inequality constraints also requires that `batch_limit`
+            is set to 1, which will be done automatically if not specified in
+            `options`.
         fixed_features: A map `{feature_index: value}` for features that
             should be fixed to a particular value during generation.
         post_processing_func: A function that post-processes an optimization
@@ -547,8 +543,7 @@ def optimize_acqf(
     return _optimize_acqf(opt_acqf_inputs)
 
 
-def _optimize_acqf(opt_inputs: OptimizeAcqfInputs) -> Tuple[Tensor, Tensor]:
-
+def _optimize_acqf(opt_inputs: OptimizeAcqfInputs) -> tuple[Tensor, Tensor]:
     # Handle the trivial case when all features are fixed
     if (
         opt_inputs.fixed_features is not None
@@ -575,20 +570,20 @@ def optimize_acqf_cyclic(
     q: int,
     num_restarts: int,
     raw_samples: Optional[int] = None,
-    options: Optional[Dict[str, Union[bool, float, int, str]]] = None,
-    inequality_constraints: Optional[List[Tuple[Tensor, Tensor, float]]] = None,
-    equality_constraints: Optional[List[Tuple[Tensor, Tensor, float]]] = None,
-    fixed_features: Optional[Dict[int, float]] = None,
+    options: Optional[dict[str, Union[bool, float, int, str]]] = None,
+    inequality_constraints: Optional[list[tuple[Tensor, Tensor, float]]] = None,
+    equality_constraints: Optional[list[tuple[Tensor, Tensor, float]]] = None,
+    fixed_features: Optional[dict[int, float]] = None,
     post_processing_func: Optional[Callable[[Tensor], Tensor]] = None,
     batch_initial_conditions: Optional[Tensor] = None,
-    cyclic_options: Optional[Dict[str, Union[bool, float, int, str]]] = None,
+    cyclic_options: Optional[dict[str, Union[bool, float, int, str]]] = None,
     *,
     ic_generator: Optional[TGenInitialConditions] = None,
     timeout_sec: Optional[float] = None,
     return_full_tree: bool = False,
     retry_on_optimization_warning: bool = True,
     **ic_gen_kwargs: Any,
-) -> Tuple[Tensor, Tensor]:
+) -> tuple[Tensor, Tensor]:
     r"""Generate a set of `q` candidates via cyclic optimization.
 
     Args:
@@ -706,20 +701,20 @@ def optimize_acqf_cyclic(
 
 
 def optimize_acqf_list(
-    acq_function_list: List[AcquisitionFunction],
+    acq_function_list: list[AcquisitionFunction],
     bounds: Tensor,
     num_restarts: int,
     raw_samples: Optional[int] = None,
-    options: Optional[Dict[str, Union[bool, float, int, str]]] = None,
-    inequality_constraints: Optional[List[Tuple[Tensor, Tensor, float]]] = None,
-    equality_constraints: Optional[List[Tuple[Tensor, Tensor, float]]] = None,
-    nonlinear_inequality_constraints: Optional[List[Callable]] = None,
-    fixed_features: Optional[Dict[int, float]] = None,
-    fixed_features_list: Optional[List[Dict[int, float]]] = None,
+    options: Optional[dict[str, Union[bool, float, int, str]]] = None,
+    inequality_constraints: Optional[list[tuple[Tensor, Tensor, float]]] = None,
+    equality_constraints: Optional[list[tuple[Tensor, Tensor, float]]] = None,
+    nonlinear_inequality_constraints: Optional[list[tuple[Callable, bool]]] = None,
+    fixed_features: Optional[dict[int, float]] = None,
+    fixed_features_list: Optional[list[dict[int, float]]] = None,
     post_processing_func: Optional[Callable[[Tensor], Tensor]] = None,
     ic_generator: Optional[TGenInitialConditions] = None,
-    ic_gen_kwargs: Optional[Dict] = None,
-) -> Tuple[Tensor, Tensor]:
+    ic_gen_kwargs: Optional[dict] = None,
+) -> tuple[Tensor, Tensor]:
     r"""Generate a list of candidates from a list of acquisition functions.
 
     The acquisition functions are optimized in sequence, with previous candidates
@@ -741,14 +736,21 @@ def optimize_acqf_list(
         equality constraints: A list of tuples (indices, coefficients, rhs),
             with each tuple encoding an inequality constraint of the form
             `\sum_i (X[indices[i]] * coefficients[i]) = rhs`
-        nonlinear_inequality_constraints: A list of callables with that represent
-            non-linear inequality constraints of the form `callable(x) >= 0`. Each
-            callable is expected to take a `(num_restarts) x q x d`-dim tensor as an
-            input and return a `(num_restarts) x q`-dim tensor with the constraint
-            values. The constraints will later be passed to SLSQP. You need to pass in
-            `batch_initial_conditions` in this case. Using non-linear inequality
-            constraints also requires that `batch_limit` is set to 1, which will be
-            done automatically if not specified in `options`.
+        nonlinear_inequality_constraints: A list of tuples representing the nonlinear
+            inequality constraints. The first element in the tuple is a callable
+            representing a constraint of the form `callable(x) >= 0`. In case of an
+            intra-point constraint, `callable()`takes in an one-dimensional tensor of
+            shape `d` and returns a scalar. In case of an inter-point constraint,
+            `callable()` takes a two dimensional tensor of shape `q x d` and again
+            returns a scalar. The second element is a boolean, indicating if it is an
+            intra-point or inter-point constraint (`True` for intra-point. `False` for
+            inter-point). For more information on intra-point vs inter-point
+            constraints, see the docstring of the `inequality_constraints` argument to
+            `optimize_acqf()`. The constraints will later be passed to the scipy
+            solver. You need to pass in `batch_initial_conditions` in this case.
+            Using non-linear inequality constraints also requires that `batch_limit`
+            is set to 1, which will be done automatically if not specified in
+            `options`.
         fixed_features: A map `{feature_index: value}` for features that
             should be fixed to a particular value during generation.
         fixed_features_list: A list of maps `{feature_index: value}`. The i-th
@@ -835,18 +837,17 @@ def optimize_acqf_mixed(
     bounds: Tensor,
     q: int,
     num_restarts: int,
-    fixed_features_list: List[Dict[int, float]],
+    fixed_features_list: list[dict[int, float]],
     raw_samples: Optional[int] = None,
-    options: Optional[Dict[str, Union[bool, float, int, str]]] = None,
-    inequality_constraints: Optional[List[Tuple[Tensor, Tensor, float]]] = None,
-    equality_constraints: Optional[List[Tuple[Tensor, Tensor, float]]] = None,
-    nonlinear_inequality_constraints: Optional[List[Callable]] = None,
+    options: Optional[dict[str, Union[bool, float, int, str]]] = None,
+    inequality_constraints: Optional[list[tuple[Tensor, Tensor, float]]] = None,
+    equality_constraints: Optional[list[tuple[Tensor, Tensor, float]]] = None,
+    nonlinear_inequality_constraints: Optional[list[tuple[Callable, bool]]] = None,
     post_processing_func: Optional[Callable[[Tensor], Tensor]] = None,
     batch_initial_conditions: Optional[Tensor] = None,
     ic_generator: Optional[TGenInitialConditions] = None,
-    ic_gen_kwargs: Optional[Dict] = None,
-    **kwargs: Any,
-) -> Tuple[Tensor, Tensor]:
+    ic_gen_kwargs: Optional[dict] = None,
+) -> tuple[Tensor, Tensor]:
     r"""Optimize over a list of fixed_features and returns the best solution.
 
     This is useful for optimizing over mixed continuous and discrete domains.
@@ -872,14 +873,21 @@ def optimize_acqf_mixed(
         equality constraints: A list of tuples (indices, coefficients, rhs),
             with each tuple encoding an inequality constraint of the form
             `\sum_i (X[indices[i]] * coefficients[i]) = rhs`
-        nonlinear_inequality_constraints: A list of callables with that represent
-            non-linear inequality constraints of the form `callable(x) >= 0`. Each
-            callable is expected to take a `(num_restarts) x q x d`-dim tensor as an
-            input and return a `(num_restarts) x q`-dim tensor with the constraint
-            values. The constraints will later be passed to SLSQP. You need to pass in
-            `batch_initial_conditions` in this case. Using non-linear inequality
-            constraints also requires that `batch_limit` is set to 1, which will be
-            done automatically if not specified in `options`.
+        nonlinear_inequality_constraints: A list of tuples representing the nonlinear
+            inequality constraints. The first element in the tuple is a callable
+            representing a constraint of the form `callable(x) >= 0`. In case of an
+            intra-point constraint, `callable()`takes in an one-dimensional tensor of
+            shape `d` and returns a scalar. In case of an inter-point constraint,
+            `callable()` takes a two dimensional tensor of shape `q x d` and again
+            returns a scalar. The second element is a boolean, indicating if it is an
+            intra-point or inter-point constraint (`True` for intra-point. `False` for
+            inter-point). For more information on intra-point vs inter-point
+            constraints, see the docstring of the `inequality_constraints` argument to
+            `optimize_acqf()`. The constraints will later be passed to the scipy
+            solver. You need to pass in `batch_initial_conditions` in this case.
+            Using non-linear inequality constraints also requires that `batch_limit`
+            is set to 1, which will be done automatically if not specified in
+            `options`.
         post_processing_func: A function that post-processes an optimization
             result appropriately (i.e., according to `round-trip`
             transformations).
@@ -892,8 +900,6 @@ def optimize_acqf_mixed(
             for nonlinear inequality constraints.
         ic_gen_kwargs: Additional keyword arguments passed to function specified by
             `ic_generator`
-        kwargs: kwargs do nothing. This is provided so that the same arguments can
-            be passed to different acquisition functions without raising an error.
 
     Returns:
         A two-element tuple containing
@@ -911,7 +917,6 @@ def optimize_acqf_mixed(
                 "are currently not supported when `q > 1`. This is needed to "
                 "compute the joint acquisition value."
             )
-    _raise_deprecation_warning_if_kwargs("optimize_acqf_mixed", kwargs)
 
     ic_gen_kwargs = ic_gen_kwargs or {}
 
@@ -988,8 +993,7 @@ def optimize_acqf_discrete(
     choices: Tensor,
     max_batch_size: int = 2048,
     unique: bool = True,
-    **kwargs: Any,
-) -> Tuple[Tensor, Tensor]:
+) -> tuple[Tensor, Tensor]:
     r"""Optimize over a discrete set of points using batch evaluation.
 
     For `q > 1` this function generates candidates by means of sequential
@@ -1006,11 +1010,9 @@ def optimize_acqf_discrete(
             a large training set.
         unique: If True return unique choices, o/w choices may be repeated
             (only relevant if `q > 1`).
-        kwargs: kwargs do nothing. This is provided so that the same arguments can
-            be passed to different acquisition functions without raising an error.
 
     Returns:
-        A three-element tuple containing
+        A two-element tuple containing
 
         - a `q x d`-dim tensor of generated candidates.
         - an associated acquisition value.
@@ -1022,7 +1024,6 @@ def optimize_acqf_discrete(
         )
     if choices.numel() == 0:
         raise InputDataError("`choices` must be non-emtpy.")
-    _raise_deprecation_warning_if_kwargs("optimize_acqf_discrete", kwargs)
     choices_batched = choices.unsqueeze(-2)
     if q > 1:
         candidate_list, acq_value_list = [], []
@@ -1070,9 +1071,9 @@ def _split_batch_eval_acqf(
 
 def _generate_neighbors(
     x: Tensor,
-    discrete_choices: List[Tensor],
+    discrete_choices: list[Tensor],
     X_avoid: Tensor,
-    inequality_constraints: List[Tuple[Tensor, Tensor, float]],
+    inequality_constraints: list[tuple[Tensor, Tensor, float]],
 ):
     # generate all 1D perturbations
     npts = sum([len(c) for c in discrete_choices])
@@ -1088,11 +1089,11 @@ def _generate_neighbors(
 
 
 def _filter_infeasible(
-    X: Tensor, inequality_constraints: List[Tuple[Tensor, Tensor, float]]
+    X: Tensor, inequality_constraints: list[tuple[Tensor, Tensor, float]]
 ):
     """Remove all points from `X` that don't satisfy the constraints."""
     is_feasible = torch.ones(X.shape[0], dtype=torch.bool, device=X.device)
-    for (inds, weights, bound) in inequality_constraints:
+    for inds, weights, bound in inequality_constraints:
         is_feasible &= (X[..., inds] * weights).sum(dim=-1) >= bound
     return X[is_feasible]
 
@@ -1103,10 +1104,10 @@ def _filter_invalid(X: Tensor, X_avoid: Tensor):
 
 
 def _gen_batch_initial_conditions_local_search(
-    discrete_choices: List[Tensor],
+    discrete_choices: list[Tensor],
     raw_samples: int,
     X_avoid: Tensor,
-    inequality_constraints: List[Tuple[Tensor, Tensor, float]],
+    inequality_constraints: list[tuple[Tensor, Tensor, float]],
     min_points: int,
     max_tries: int = 100,
 ):
@@ -1131,17 +1132,16 @@ def _gen_batch_initial_conditions_local_search(
 
 def optimize_acqf_discrete_local_search(
     acq_function: AcquisitionFunction,
-    discrete_choices: List[Tensor],
+    discrete_choices: list[Tensor],
     q: int,
     num_restarts: int = 20,
     raw_samples: int = 4096,
-    inequality_constraints: Optional[List[Tuple[Tensor, Tensor, float]]] = None,
+    inequality_constraints: Optional[list[tuple[Tensor, Tensor, float]]] = None,
     X_avoid: Optional[Tensor] = None,
     batch_initial_conditions: Optional[Tensor] = None,
     max_batch_size: int = 2048,
     unique: bool = True,
-    **kwargs: Any,
-) -> Tuple[Tensor, Tensor]:
+) -> tuple[Tensor, Tensor]:
     r"""Optimize acquisition function over a lattice.
 
     This is useful when d is large and enumeration of the search space
@@ -1173,8 +1173,6 @@ def optimize_acqf_discrete_local_search(
             a large training set.
         unique: If True return unique choices, o/w choices may be repeated
             (only relevant if `q > 1`).
-        kwargs: kwargs do nothing. This is provided so that the same arguments can
-            be passed to different acquisition functions without raising an error.
 
     Returns:
         A two-element tuple containing
@@ -1182,7 +1180,6 @@ def optimize_acqf_discrete_local_search(
         - a `q x d`-dim tensor of generated candidates.
         - an associated acquisition value.
     """
-    _raise_deprecation_warning_if_kwargs("optimize_acqf_discrete_local_search", kwargs)
     candidate_list = []
     base_X_pending = acq_function.X_pending if q > 1 else None
     base_X_avoid = X_avoid

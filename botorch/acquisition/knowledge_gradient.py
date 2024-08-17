@@ -27,7 +27,7 @@ and [Wu2016parallelkg]_.
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import Any, Callable, Dict, Optional, Tuple, Type
+from typing import Any, Callable, Optional
 
 import torch
 from botorch import settings
@@ -74,7 +74,6 @@ class qKnowledgeGradient(MCAcquisitionFunction, OneShotAcquisitionFunction):
         inner_sampler: Optional[MCSampler] = None,
         X_pending: Optional[Tensor] = None,
         current_value: Optional[Tensor] = None,
-        **kwargs: Any,
     ) -> None:
         r"""q-Knowledge Gradient (one-shot optimization).
 
@@ -185,7 +184,8 @@ class qKnowledgeGradient(MCAcquisitionFunction, OneShotAcquisitionFunction):
 
         # construct the fantasy model of shape `num_fantasies x b`
         fantasy_model = self.model.fantasize(
-            X=X_actual, sampler=self.sampler, observation_noise=True
+            X=X_actual,
+            sampler=self.sampler,
         )
 
         # get the value function
@@ -234,7 +234,8 @@ class qKnowledgeGradient(MCAcquisitionFunction, OneShotAcquisitionFunction):
 
         # construct the fantasy model of shape `num_fantasies x b`
         fantasy_model = self.model.fantasize(
-            X=X, sampler=self.sampler, observation_noise=True
+            X=X,
+            sampler=self.sampler,
         )
 
         # get the value function
@@ -328,9 +329,8 @@ class qMultiFidelityKnowledgeGradient(qKnowledgeGradient):
         cost_aware_utility: Optional[CostAwareUtility] = None,
         project: Callable[[Tensor], Tensor] = lambda X: X,
         expand: Callable[[Tensor], Tensor] = lambda X: X,
-        valfunc_cls: Optional[Type[AcquisitionFunction]] = None,
-        valfunc_argfac: Optional[Callable[[Model], Dict[str, Any]]] = None,
-        **kwargs: Any,
+        valfunc_cls: Optional[type[AcquisitionFunction]] = None,
+        valfunc_argfac: Optional[Callable[[Model], dict[str, Any]]] = None,
     ) -> None:
         r"""Multi-Fidelity q-Knowledge Gradient (one-shot optimization).
 
@@ -427,7 +427,7 @@ class qMultiFidelityKnowledgeGradient(qKnowledgeGradient):
                 `X_actual = X[..., :-num_fantasies, :]`
                 `X_actual.shape = b x q x d`
 
-                In addition, `X` may be augmented with fidelity parameteres as
+                In addition, `X` may be augmented with fidelity parameters as
                 part of thee `d`-dimension. Projecting fidelities to the target
                 fidelity is handled by `project`.
 
@@ -453,7 +453,8 @@ class qMultiFidelityKnowledgeGradient(qKnowledgeGradient):
         # construct the fantasy model of shape `num_fantasies x b`
         # expand X (to potentially add trace observations)
         fantasy_model = self.model.fantasize(
-            X=self.expand(X_eval), sampler=self.sampler, observation_noise=True
+            X=self.expand(X_eval),
+            sampler=self.sampler,
         )
         # get the value function
         value_function = _get_value_function(
@@ -519,12 +520,12 @@ def _get_value_function(
     posterior_transform: Optional[PosteriorTransform] = None,
     sampler: Optional[MCSampler] = None,
     project: Optional[Callable[[Tensor], Tensor]] = None,
-    valfunc_cls: Optional[Type[AcquisitionFunction]] = None,
-    valfunc_argfac: Optional[Callable[[Model], Dict[str, Any]]] = None,
+    valfunc_cls: Optional[type[AcquisitionFunction]] = None,
+    valfunc_argfac: Optional[Callable[[Model], dict[str, Any]]] = None,
 ) -> AcquisitionFunction:
     r"""Construct value function (i.e. inner acquisition function)."""
     if valfunc_cls is not None:
-        common_kwargs: Dict[str, Any] = {
+        common_kwargs: dict[str, Any] = {
             "model": model,
             "posterior_transform": posterior_transform,
         }
@@ -555,7 +556,7 @@ def _get_value_function(
         )
 
 
-def _split_fantasy_points(X: Tensor, n_f: int) -> Tuple[Tensor, Tensor]:
+def _split_fantasy_points(X: Tensor, n_f: int) -> tuple[Tensor, Tensor]:
     r"""Split a one-shot optimization input into actual and fantasy points
 
     Args:

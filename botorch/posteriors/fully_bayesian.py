@@ -5,7 +5,8 @@
 
 from __future__ import annotations
 
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional
+from warnings import warn
 
 import torch
 from botorch.posteriors.gpytorch import GPyTorchPosterior
@@ -54,7 +55,7 @@ def batched_bisect(
     return center
 
 
-def _quantile(posterior: FullyBayesianPosterior, value: Tensor) -> Tensor:
+def _quantile(posterior: GaussianMixturePosterior, value: Tensor) -> Tensor:
     r"""Compute the posterior quantiles for the mixture of models."""
     if value.numel() > 1:
         return torch.stack(
@@ -78,13 +79,13 @@ def _quantile(posterior: FullyBayesianPosterior, value: Tensor) -> Tensor:
     )
 
 
-class FullyBayesianPosterior(GPyTorchPosterior):
-    r"""A posterior for a fully Bayesian model.
+class GaussianMixturePosterior(GPyTorchPosterior):
+    r"""A Gaussian mixture posterior.
 
     The MCMC batch dimension that corresponds to the models in the mixture is located
     at `MCMC_DIM` (defined at the top of this file). Note that while each MCMC sample
-    corresponds to a Gaussian posterior, the fully Bayesian posterior is rather a
-    mixture of Gaussian distributions.
+    corresponds to a Gaussian posterior, the posterior is rather a mixture of Gaussian
+    distributions.
     """
 
     def __init__(self, distribution: MultivariateNormal) -> None:
@@ -102,9 +103,11 @@ class FullyBayesianPosterior(GPyTorchPosterior):
             if self._is_mt
             else distribution.variance.unsqueeze(-1)
         )
+        self._covariance_matrix = distribution.lazy_covariance_matrix
 
         self._mixture_mean: Optional[Tensor] = None
         self._mixture_variance: Optional[Tensor] = None
+        self._mixture_covariance_matrix: Optional[Tensor] = None
 
     @property
     def mixture_mean(self) -> Tensor:
@@ -124,12 +127,27 @@ class FullyBayesianPosterior(GPyTorchPosterior):
             self._mixture_variance = t1 + t2 + t3
         return self._mixture_variance
 
+    @property
+    def mixture_covariance_matrix(self) -> Tensor:
+        r"""The posterior covariance matrix for the mixture of models."""
+        if self._mixture_covariance_matrix is None:
+            num_mcmc_samples = self.mean.shape[MCMC_DIM]
+            t1 = self._covariance_matrix.sum(dim=MCMC_DIM) / num_mcmc_samples
+            mean_diff = self._mean - self.mixture_mean.unsqueeze(MCMC_DIM)
+            t2 = (
+                torch.matmul(mean_diff, mean_diff.transpose(-1, -2)).sum(dim=MCMC_DIM)
+                / num_mcmc_samples
+            )
+            self._mixture_covariance_matrix = t1 + t2
+
+        return self._mixture_covariance_matrix
+
     def quantile(self, value: Tensor) -> Tensor:
         r"""Compute the posterior quantiles for the mixture of models."""
         return _quantile(posterior=self, value=value)
 
     @property
-    def batch_range(self) -> Tuple[int, int]:
+    def batch_range(self) -> tuple[int, int]:
         r"""The t-batch range.
 
         This is used in samplers to identify the t-batch component of the
@@ -137,7 +155,17 @@ class FullyBayesianPosterior(GPyTorchPosterior):
         provide consistency in the acquisition values, i.e., to ensure that a
         candidate produces same value regardless of its position on the t-batch.
         """
-        if self._is_mt:
-            return (0, -2)
-        else:
-            return (0, -1)
+        return (0, -2) if self._is_mt else (0, -1)
+
+
+class FullyBayesianPosterior(GaussianMixturePosterior):
+    """For backwards compatibility."""
+
+    def __init__(self, distribution: MultivariateNormal) -> None:
+        """DEPRECATED."""
+        warn(
+            "`FullyBayesianPosterior` is marked for deprecation, consider using "
+            "`GaussianMixturePosterior` instead.",
+            DeprecationWarning,
+        )
+        super().__init__(distribution=distribution)

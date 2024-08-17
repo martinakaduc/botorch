@@ -13,14 +13,24 @@ from unittest import mock
 import torch
 from botorch import settings
 from botorch.acquisition import (
+    AcquisitionFunction,
     LogImprovementMCAcquisitionFunction,
     qLogExpectedImprovement,
     qLogNoisyExpectedImprovement,
+)
+from botorch.acquisition.analytic import (
+    ExpectedImprovement,
+    LogExpectedImprovement,
+    LogNoisyExpectedImprovement,
+    NoisyExpectedImprovement,
 )
 from botorch.acquisition.input_constructors import ACQF_INPUT_CONSTRUCTOR_REGISTRY
 from botorch.acquisition.monte_carlo import (
     qExpectedImprovement,
     qNoisyExpectedImprovement,
+)
+from botorch.acquisition.multi_objective.logei import (
+    qLogNoisyExpectedHypervolumeImprovement,
 )
 
 from botorch.acquisition.objective import (
@@ -30,9 +40,10 @@ from botorch.acquisition.objective import (
     PosteriorTransform,
     ScalarizedPosteriorTransform,
 )
+from botorch.acquisition.utils import prune_inferior_points
 from botorch.exceptions import BotorchWarning, UnsupportedError
 from botorch.exceptions.errors import BotorchError
-from botorch.models import SingleTaskGP
+from botorch.models import ModelListGP, SingleTaskGP
 from botorch.sampling.normal import IIDNormalSampler, SobolQMCNormalSampler
 from botorch.utils.low_rank import sample_cached_cholesky
 from botorch.utils.testing import BotorchTestCase, MockModel, MockPosterior
@@ -223,12 +234,10 @@ class TestQLogExpectedImprovement(BotorchTestCase):
             acqf = qLogExpectedImprovement(model=mm, best_f=0, sampler=sampler)
             exp_log_res = acqf(X).exp()
             # with no approximations (qEI): self.assertEqual(res[0].item(), 1.0)
-            # in the batch case, the values get adjusted toward
             self.assertEqual(exp_log_res.dtype, dtype)
             self.assertEqual(exp_log_res.device.type, self.device.type)
             self.assertTrue(1.0 <= exp_log_res[0].item())
             self.assertTrue(exp_log_res[0].item() <= 1.0 + acqf.tau_relu)
-            # self.assertAllClose(exp_log_res[0], torch.ones_like(exp_log_res[0]), )
 
             # with no approximations (qEI): self.assertEqual(res[1].item(), 0.0)
             self.assertTrue(0 < exp_log_res[1].item())
@@ -494,31 +503,58 @@ class TestQLogNoisyExpectedImprovement(BotorchTestCase):
     def test_prune_baseline(self):
         no = "botorch.utils.testing.MockModel.num_outputs"
         prune = "botorch.acquisition.logei.prune_inferior_points"
+        constraints = [lambda Y: Y[..., 1] + 0.1]
+        # only the last sample if feasible and it has the worst objective value
+        mc_obj = GenericMCObjective(objective=lambda Y, X: Y[..., 0])
+
         for dtype in (torch.float, torch.double):
-            X_baseline = torch.zeros(1, 1, device=self.device, dtype=dtype)
-            X_pruned = torch.rand(1, 1, device=self.device, dtype=dtype)
+            samples = torch.tensor(
+                [[1.0, 1.0], [0.0, 0.0], [-1.0, -1.0]],
+                device=self.device,
+                dtype=dtype,
+            )
+            mm = MockModel(
+                MockPosterior(
+                    samples=samples,
+                )
+            )
+            X_baseline = torch.zeros(3, 1, device=self.device, dtype=dtype)
             with mock.patch(no, new_callable=mock.PropertyMock) as mock_num_outputs:
-                mock_num_outputs.return_value = 1
-                mm = MockModel(MockPosterior(samples=X_baseline))
-                with mock.patch(prune, return_value=X_pruned) as mock_prune:
+                mock_num_outputs.return_value = 2
+                with mock.patch(prune, wraps=prune_inferior_points) as mock_prune:
                     acqf = qLogNoisyExpectedImprovement(
                         model=mm,
                         X_baseline=X_baseline,
                         prune_baseline=True,
                         cache_root=False,
+                        objective=mc_obj,
+                        constraints=constraints,
                     )
                 mock_prune.assert_called_once()
-                self.assertTrue(torch.equal(acqf.X_baseline, X_pruned))
-                with mock.patch(prune, return_value=X_pruned) as mock_prune:
+                self.assertIs(mock_prune.call_args[1]["constraints"], constraints)
+                self.assertTrue(torch.equal(acqf.X_baseline, X_baseline[[-1]]))
+                # test marginalize_dim
+                samples2 = torch.stack([samples, samples * 2], dim=0)
+                mm = MockModel(
+                    MockPosterior(
+                        samples=samples2,
+                    )
+                )
+                with mock.patch(prune, wraps=prune_inferior_points) as mock_prune:
                     acqf = qLogNoisyExpectedImprovement(
                         model=mm,
                         X_baseline=X_baseline,
                         prune_baseline=True,
-                        marginalize_dim=-3,
                         cache_root=False,
+                        marginalize_dim=-3,
+                        objective=mc_obj,
+                        constraints=constraints,
                     )
-                    _, kwargs = mock_prune.call_args
-                    self.assertEqual(kwargs["marginalize_dim"], -3)
+                mock_prune.assert_called_once()
+                _, kwargs = mock_prune.call_args
+                self.assertIs(kwargs["constraints"], constraints)
+                self.assertTrue(torch.equal(acqf.X_baseline, X_baseline[[-1]]))
+                self.assertEqual(kwargs["marginalize_dim"], -3)
 
     def test_cache_root(self):
         sample_cached_path = (
@@ -689,6 +725,47 @@ class TestQLogNoisyExpectedImprovement(BotorchTestCase):
                     self.assertAllClose(best_feas_f, acqf.compute_best_f(obj))
                 else:
                     self.assertAllClose(
-                        best_feas_f, torch.full_like(obj[..., [0]], -infcost.item())
+                        best_feas_f, torch.full_like(obj[..., 0], -infcost.item())
                     )
         # TODO: Test different objectives (incl. constraints)
+
+
+class TestIsLog(BotorchTestCase):
+    def test_is_log(self):
+        # the flag is False by default
+        self.assertFalse(AcquisitionFunction._log)
+
+        # single objective case
+        X, Y = torch.rand(3, 2), torch.randn(3, 1)
+        model = SingleTaskGP(train_X=X, train_Y=Y, train_Yvar=torch.rand_like(Y))
+
+        # (q)LogEI
+        for acqf_class in [LogExpectedImprovement, qLogExpectedImprovement]:
+            acqf = acqf_class(model=model, best_f=0.0)
+            self.assertTrue(acqf._log)
+
+        # (q)EI
+        for acqf_class in [ExpectedImprovement, qExpectedImprovement]:
+            acqf = acqf_class(model=model, best_f=0.0)
+            self.assertFalse(acqf._log)
+
+        # (q)LogNEI
+        for acqf_class in [LogNoisyExpectedImprovement, qLogNoisyExpectedImprovement]:
+            # avoiding keywords since they differ: X_observed vs. X_baseline
+            acqf = acqf_class(model, X)
+            self.assertTrue(acqf._log)
+
+        # (q)NEI
+        for acqf_class in [NoisyExpectedImprovement, qNoisyExpectedImprovement]:
+            acqf = acqf_class(model, X)
+            self.assertFalse(acqf._log)
+
+        # multi-objective case
+        model_list = ModelListGP(model, model)
+        ref_point = [4, 2]  # the meaning of life
+
+        # qLogNEHVI
+        acqf = qLogNoisyExpectedHypervolumeImprovement(
+            model=model_list, X_baseline=X, ref_point=ref_point
+        )
+        self.assertTrue(acqf._log)

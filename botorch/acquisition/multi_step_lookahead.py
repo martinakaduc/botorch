@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 r"""
-A general implementation of multi-step look-ahead acquistion function with configurable
+A general implementation of multi-step look-ahead acquisition function with configurable
 value functions. See [Jiang2020multistep]_.
 
 .. [Jiang2020multistep]
@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import math
 import warnings
-from typing import Any, Callable, Dict, List, Optional, Tuple, Type
+from typing import Any, Callable, Optional
 
 import numpy as np
 import torch
@@ -43,7 +43,7 @@ from torch.distributions import Beta
 from torch.nn import ModuleList
 
 
-TAcqfArgConstructor = Callable[[Model, Tensor], Dict[str, Any]]
+TAcqfArgConstructor = Callable[[Model, Tensor], dict[str, Any]]
 
 
 class qMultiStepLookahead(MCAcquisitionFunction, OneShotAcquisitionFunction):
@@ -52,14 +52,14 @@ class qMultiStepLookahead(MCAcquisitionFunction, OneShotAcquisitionFunction):
     def __init__(
         self,
         model: Model,
-        batch_sizes: List[int],
-        num_fantasies: Optional[List[int]] = None,
-        samplers: Optional[List[MCSampler]] = None,
-        valfunc_cls: Optional[List[Optional[Type[AcquisitionFunction]]]] = None,
-        valfunc_argfacs: Optional[List[Optional[TAcqfArgConstructor]]] = None,
+        batch_sizes: list[int],
+        num_fantasies: Optional[list[int]] = None,
+        samplers: Optional[list[MCSampler]] = None,
+        valfunc_cls: Optional[list[Optional[type[AcquisitionFunction]]]] = None,
+        valfunc_argfacs: Optional[list[Optional[TAcqfArgConstructor]]] = None,
         objective: Optional[MCAcquisitionObjective] = None,
         posterior_transform: Optional[PosteriorTransform] = None,
-        inner_mc_samples: Optional[List[int]] = None,
+        inner_mc_samples: Optional[list[int]] = None,
         X_pending: Optional[Tensor] = None,
         collapse_fantasy_base_samples: bool = True,
     ) -> None:
@@ -131,7 +131,7 @@ class qMultiStepLookahead(MCAcquisitionFunction, OneShotAcquisitionFunction):
         if samplers is None:
             # If collapse_fantasy_base_samples is False, the `batch_range_override`
             # is set on the samplers during the forward call.
-            samplers: List[MCSampler] = [
+            samplers: list[MCSampler] = [
                 SobolQMCNormalSampler(sample_shape=torch.Size([nf]))
                 for nf in num_fantasies
             ]
@@ -214,18 +214,18 @@ class qMultiStepLookahead(MCAcquisitionFunction, OneShotAcquisitionFunction):
             s.batch_range_override = (tbatch_dim_start, -2)
 
     def get_augmented_q_batch_size(self, q: int) -> int:
-        r"""Get augmented q batch size for one-shot optimzation.
+        r"""Get augmented q batch size for one-shot optimization.
 
         Args:
             q: The number of candidates to consider jointly.
 
         Returns:
-            The augmented size for one-shot optimzation (including variables
+            The augmented size for one-shot optimization (including variables
             parameterizing the fantasy solutions): `q_0 + f_1 q_1 + f_2 f_1 q_2 + ...`
         """
         return q + self._num_auxiliary
 
-    def get_split_shapes(self, X: Tensor) -> Tuple[Size, List[Size], List[int]]:
+    def get_split_shapes(self, X: Tensor) -> tuple[Size, list[Size], list[int]]:
         r"""Get the split shapes from X.
 
         Args:
@@ -249,7 +249,7 @@ class qMultiStepLookahead(MCAcquisitionFunction, OneShotAcquisitionFunction):
         sizes = [s[: (-2 - len(batch_shape))].numel() * s[-2] for s in shapes]
         return batch_shape, shapes, sizes
 
-    def get_multi_step_tree_input_representation(self, X: Tensor) -> List[Tensor]:
+    def get_multi_step_tree_input_representation(self, X: Tensor) -> list[Tensor]:
         r"""Get the multi-step tree representation of X.
 
         Args:
@@ -316,13 +316,13 @@ class qMultiStepLookahead(MCAcquisitionFunction, OneShotAcquisitionFunction):
 
 def _step(
     model: Model,
-    Xs: List[Tensor],
-    samplers: List[Optional[MCSampler]],
-    valfunc_cls: List[Optional[Type[AcquisitionFunction]]],
-    valfunc_argfacs: List[Optional[TAcqfArgConstructor]],
-    inner_samplers: List[Optional[MCSampler]],
+    Xs: list[Tensor],
+    samplers: list[Optional[MCSampler]],
+    valfunc_cls: list[Optional[type[AcquisitionFunction]]],
+    valfunc_argfacs: list[Optional[TAcqfArgConstructor]],
+    inner_samplers: list[Optional[MCSampler]],
     objective: MCAcquisitionObjective,
-    posterior_transform: PosteriorTransform,
+    posterior_transform: Optional[PosteriorTransform],
     running_val: Optional[Tensor] = None,
     sample_weights: Optional[Tensor] = None,
     step_index: int = 0,
@@ -399,7 +399,7 @@ def _step(
     # construct fantasy model (with batch shape f_{j+1} x ... x f_1 x batch_shape)
     prop_grads = step_index > 0  # need to propagate gradients for steps > 0
     fantasy_model = model.fantasize(
-        X=X, sampler=samplers[0], observation_noise=True, propagate_grads=prop_grads
+        X=X, sampler=samplers[0], propagate_grads=prop_grads
     )
 
     # augment sample weights appropriately
@@ -424,10 +424,10 @@ def _step(
 
 def _compute_stage_value(
     model: Model,
-    valfunc_cls: Optional[Type[AcquisitionFunction]],
+    valfunc_cls: Optional[type[AcquisitionFunction]],
     X: Tensor,
     objective: MCAcquisitionObjective,
-    posterior_transform: PosteriorTransform,
+    posterior_transform: Optional[PosteriorTransform],
     inner_sampler: Optional[MCSampler] = None,
     arg_fac: Optional[TAcqfArgConstructor] = None,
 ) -> Optional[Tensor]:
@@ -455,7 +455,7 @@ def _compute_stage_value(
     """
     if valfunc_cls is None:
         return None
-    common_kwargs: Dict[str, Any] = {
+    common_kwargs: dict[str, Any] = {
         "model": model,
         "posterior_transform": posterior_transform,
     }
@@ -500,11 +500,11 @@ def _construct_sample_weights(
 
 
 def _construct_inner_samplers(
-    batch_sizes: List[int],
-    valfunc_cls: List[Optional[Type[AcquisitionFunction]]],
-    inner_mc_samples: List[Optional[int]],
+    batch_sizes: list[int],
+    valfunc_cls: list[Optional[type[AcquisitionFunction]]],
+    inner_mc_samples: list[Optional[int]],
     objective: Optional[MCAcquisitionObjective] = None,
-) -> List[Optional[MCSampler]]:
+) -> list[Optional[MCSampler]]:
     r"""Check validity of inputs and construct inner samplers.
 
     Helper function to be used internally for constructing inner samplers.
@@ -549,7 +549,7 @@ def _construct_inner_samplers(
                 )
             if q is not None and mcs is not None:
                 warnings.warn(
-                    "inner_mc_samples is ignored for analytic acquistion functions",
+                    "inner_mc_samples is ignored for analytic acquisition functions",
                     BotorchWarning,
                 )
             inner_samplers.append(None)
@@ -562,7 +562,7 @@ def _construct_inner_samplers(
 
 
 def _get_induced_fantasy_model(
-    model: Model, Xs: List[Tensor], samplers: List[Optional[MCSampler]]
+    model: Model, Xs: list[Tensor], samplers: list[Optional[MCSampler]]
 ) -> Model:
     r"""Recursive computation of the fantasy model induced by an input tree.
 
@@ -585,7 +585,6 @@ def _get_induced_fantasy_model(
         fantasy_model = model.fantasize(
             X=Xs[0],
             sampler=samplers[0],
-            observation_noise=True,
         )
 
         return _get_induced_fantasy_model(
@@ -599,7 +598,6 @@ def warmstart_multistep(
     num_restarts: int,
     raw_samples: int,
     full_optimizer: Tensor,
-    **kwargs: Any,
 ) -> Tensor:
     r"""Warm-start initialization for multi-step look-ahead acquisition functions.
 
@@ -615,7 +613,6 @@ def warmstart_multistep(
         full_optimizer: The full tree of optimizers of the previous iteration of shape
             `batch_shape x q' x d`. Typically obtained by passing
             `return_best_only=False` and `return_full_tree=True` into `optimize_acqf`.
-        kwargs: Optimization kwargs.
 
     Returns:
         A `num_restarts x q' x d` tensor for initial points for optimization.
@@ -634,7 +631,7 @@ def warmstart_multistep(
         perturbations = unnormalize(B.sample(X.shape).squeeze(-1), bounds)
         return (1 - eta) * X + eta * perturbations
 
-    def make_init_tree(Xopts: List[Tensor], bounds: Tensor, etas: Tensor) -> Tensor:
+    def make_init_tree(Xopts: list[Tensor], bounds: Tensor, etas: Tensor) -> Tensor:
         Xtrs = [mixin_layer(X=X, bounds=bounds, eta=eta) for eta, X in zip(etas, Xopts)]
         return torch.cat(Xtrs, dim=-2)
 
@@ -663,6 +660,6 @@ def warmstart_multistep(
     return X_init[:raw_samples]
 
 
-def make_best_f(model: Model, X: Tensor) -> Dict[str, Any]:
+def make_best_f(model: Model, X: Tensor) -> dict[str, Any]:
     r"""Extract the best observed training input from the model."""
     return {"best_f": model.train_targets.max(dim=-1).values}

@@ -12,35 +12,15 @@ from __future__ import annotations
 
 import warnings
 from functools import wraps
-from typing import Any, Callable, List, Optional, TYPE_CHECKING
+from typing import Any, Callable, Optional, TYPE_CHECKING
 
 import torch
+from botorch.utils.safe_math import logmeanexp
 from torch import Tensor
 
-if TYPE_CHECKING:
-    from botorch.acquisition import AcquisitionFunction  # pragma: no cover
-    from botorch.model import Model  # pragma: no cover
-
-
-def squeeze_last_dim(Y: Tensor) -> Tensor:
-    r"""Squeeze the last dimension of a Tensor.
-
-    Args:
-        Y: A `... x d`-dim Tensor.
-
-    Returns:
-        The input tensor with last dimension squeezed.
-
-    Example:
-        >>> Y = torch.rand(4, 3)
-        >>> Y_squeezed = squeeze_last_dim(Y)
-    """
-    warnings.warn(
-        "`botorch.utils.transforms.squeeze_last_dim` is deprecated. "
-        "Simply use `.squeeze(-1)1 instead.",
-        DeprecationWarning,
-    )
-    return Y.squeeze(-1)
+if TYPE_CHECKING:  # pragma: no cover
+    from botorch.acquisition import AcquisitionFunction
+    from botorch.models.model import Model
 
 
 def standardize(Y: Tensor) -> Tensor:
@@ -66,8 +46,31 @@ def standardize(Y: Tensor) -> Tensor:
     return (Y - Y.mean(dim=stddim, keepdim=True)) / Y_std
 
 
+def _update_constant_bounds(bounds: Tensor) -> Tensor:
+    r"""If the lower and upper bounds are identical for a dimension, set
+    the upper bound to lower bound + 1.
+
+    If any modification is needed, this will return a clone of the original
+    tensor to avoid in-place modification.
+
+    Args:
+        bounds: A `2 x d`-dim tensor of lower and upper bounds.
+
+    Returns:
+        A `2 x d`-dim tensor of updated lower and upper bounds.
+    """
+    if (constant_dims := (bounds[1] == bounds[0])).any():
+        bounds = bounds.clone()
+        bounds[1, constant_dims] = bounds[0, constant_dims] + 1
+    return bounds
+
+
 def normalize(X: Tensor, bounds: Tensor) -> Tensor:
     r"""Min-max normalize X w.r.t. the provided bounds.
+
+    NOTE: If the upper and lower bounds are identical for a dimension, that dimension
+    will not be scaled. Such dimensions will only be shifted as
+    `new_X[..., i] = X[..., i] - bounds[0, i]`. This avoids division by zero issues.
 
     Args:
         X: `... x d` tensor of data
@@ -85,11 +88,16 @@ def normalize(X: Tensor, bounds: Tensor) -> Tensor:
         >>> bounds = torch.stack([torch.zeros(3), 0.5 * torch.ones(3)])
         >>> X_normalized = normalize(X, bounds)
     """
+    bounds = _update_constant_bounds(bounds=bounds)
     return (X - bounds[0]) / (bounds[1] - bounds[0])
 
 
 def unnormalize(X: Tensor, bounds: Tensor) -> Tensor:
     r"""Un-normalizes X w.r.t. the provided bounds.
+
+    NOTE: If the upper and lower bounds are identical for a dimension, that dimension
+    will not be scaled. Such dimensions will only be shifted as
+    `new_X[..., i] = X[..., i] + bounds[0, i]`, matching the behavior of `normalize`.
 
     Args:
         X: `... x d` tensor of data
@@ -107,10 +115,11 @@ def unnormalize(X: Tensor, bounds: Tensor) -> Tensor:
         >>> bounds = torch.stack([torch.zeros(3), 0.5 * torch.ones(3)])
         >>> X = unnormalize(X_normalized, bounds)
     """
+    bounds = _update_constant_bounds(bounds=bounds)
     return X * (bounds[1] - bounds[0]) + bounds[0]
 
 
-def normalize_indices(indices: Optional[List[int]], d: int) -> Optional[List[int]]:
+def normalize_indices(indices: Optional[list[int]], d: int) -> Optional[list[int]]:
     r"""Normalize a list of indices to ensure that they are positive.
 
     Args:
@@ -177,7 +186,7 @@ def _verify_output_shape(acqf: Any, X: Tensor, output: Tensor) -> bool:
         # acqf does not have model or acqf.model does not define `batch_shape`
         warnings.warn(
             "Output shape checks failed! Expected output shape to match t-batch shape"
-            f"of X, but got output with shape {output.shape} for X with shape"
+            f"of X, but got output with shape {output.shape} for X with shape "
             f"{X.shape}. Make sure that this is the intended behavior!",
             RuntimeWarning,
         )
@@ -185,33 +194,35 @@ def _verify_output_shape(acqf: Any, X: Tensor, output: Tensor) -> bool:
 
 
 def is_fully_bayesian(model: Model) -> bool:
-    r"""Check if at least one model is a SaasFullyBayesianSingleTaskGP
+    r"""Check if at least one model is a fully Bayesian model.
 
     Args:
         model: A BoTorch model (may be a `ModelList` or `ModelListGP`)
-        d: The dimension of the tensor to index.
 
     Returns:
-        True if at least one model is a `SaasFullyBayesianSingleTaskGP`
+       True if at least one model is a fully Bayesian model.
     """
     from botorch.models import ModelList
-    from botorch.models.fully_bayesian import SaasFullyBayesianSingleTaskGP
-    from botorch.models.fully_bayesian_multitask import SaasFullyBayesianMultiTaskGP
 
-    full_bayesian_model_cls = (
-        SaasFullyBayesianSingleTaskGP,
-        SaasFullyBayesianMultiTaskGP,
-    )
+    if isinstance(model, ModelList):
+        return any(is_fully_bayesian(m) for m in model.models)
+    return getattr(model, "_is_fully_bayesian", False)
 
-    if isinstance(model, full_bayesian_model_cls) or getattr(
-        model, "is_fully_bayesian", False
-    ):
-        return True
-    elif isinstance(model, ModelList):
-        for m in model.models:
-            if is_fully_bayesian(m):
-                return True
-    return False
+
+def is_ensemble(model: Model) -> bool:
+    r"""Check if at least one model is an ensemble model.
+
+    Args:
+        model: A BoTorch model (may be a `ModelList` or `ModelListGP`)
+
+    Returns:
+       True if at least one model is an ensemble model.
+    """
+    from botorch.models import ModelList
+
+    if isinstance(model, ModelList):
+        return any(is_ensemble(m) for m in model.models)
+    return getattr(model, "_is_ensemble", False)
 
 
 def t_batch_mode_transform(
@@ -275,8 +286,11 @@ def t_batch_mode_transform(
             # add t-batch dim
             X = X if X.dim() > 2 else X.unsqueeze(0)
             output = method(acqf, X, *args, **kwargs)
-            if hasattr(acqf, "model") and is_fully_bayesian(acqf.model):
-                output = output.mean(dim=-1)
+            if hasattr(acqf, "model") and is_ensemble(acqf.model):
+                # IDEA: this could be wrapped into SampleReducingMCAcquisitionFunction
+                output = (
+                    output.mean(dim=-1) if not acqf._log else logmeanexp(output, dim=-1)
+                )
             if assert_output_shape and not _verify_output_shape(
                 acqf=acqf,
                 X=X,

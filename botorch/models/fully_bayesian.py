@@ -33,7 +33,8 @@ References:
 
 import math
 from abc import abstractmethod
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from collections.abc import Mapping
+from typing import Any, Optional
 
 import pyro
 import torch
@@ -43,7 +44,7 @@ from botorch.models.transforms.input import InputTransform
 from botorch.models.transforms.outcome import OutcomeTransform
 from botorch.models.utils import validate_input_scaling
 from botorch.models.utils.gpytorch_modules import MIN_INFERRED_NOISE_LEVEL
-from botorch.posteriors.fully_bayesian import FullyBayesianPosterior, MCMC_DIM
+from botorch.posteriors.fully_bayesian import GaussianMixturePosterior, MCMC_DIM
 from gpytorch.constraints import GreaterThan
 from gpytorch.distributions.multivariate_normal import MultivariateNormal
 from gpytorch.kernels import MaternKernel, ScaleKernel
@@ -108,13 +109,11 @@ class PyroModel:
     The utility of `PyroModel` is in enabling fast fitting with NUTS, since we
     would otherwise need to use GPyTorch, which is computationally infeasible
     in combination with Pyro.
-
-    :meta private:
     """
 
     def set_inputs(
         self, train_X: Tensor, train_Y: Tensor, train_Yvar: Optional[Tensor] = None
-    ):
+    ) -> None:
         """Set the training data.
 
         Args:
@@ -133,15 +132,16 @@ class PyroModel:
 
     @abstractmethod
     def postprocess_mcmc_samples(
-        self, mcmc_samples: Dict[str, Tensor], **kwargs: Any
-    ) -> Dict[str, Tensor]:
+        self,
+        mcmc_samples: dict[str, Tensor],
+    ) -> dict[str, Tensor]:
         """Post-process the final MCMC samples."""
         pass  # pragma: no cover
 
     @abstractmethod
     def load_mcmc_samples(
-        self, mcmc_samples: Dict[str, Tensor]
-    ) -> Tuple[Mean, Kernel, Likelihood]:
+        self, mcmc_samples: dict[str, Tensor]
+    ) -> tuple[Mean, Kernel, Likelihood]:
         pass  # pragma: no cover
 
 
@@ -161,7 +161,7 @@ class SaasPyroModel(PyroModel):
 
     def set_inputs(
         self, train_X: Tensor, train_Y: Tensor, train_Yvar: Optional[Tensor] = None
-    ):
+    ) -> None:
         super().set_inputs(train_X, train_Y, train_Yvar)
         self.ard_num_dims = self.train_X.shape[-1]
 
@@ -176,16 +176,19 @@ class SaasPyroModel(PyroModel):
         mean = self.sample_mean(**tkwargs)
         noise = self.sample_noise(**tkwargs)
         lengthscale = self.sample_lengthscale(dim=self.ard_num_dims, **tkwargs)
-        K = matern52_kernel(X=self.train_X, lengthscale=lengthscale)
-        K = outputscale * K + noise * torch.eye(self.train_X.shape[0], **tkwargs)
-        pyro.sample(
-            "Y",
-            pyro.distributions.MultivariateNormal(
-                loc=mean.view(-1).expand(self.train_X.shape[0]),
-                covariance_matrix=K,
-            ),
-            obs=self.train_Y.squeeze(-1),
-        )
+        if self.train_Y.shape[-2] > 0:
+            # Do not attempt to sample Y if the data is empty.
+            # This leads to errors with empty data.
+            K = matern52_kernel(X=self.train_X, lengthscale=lengthscale)
+            K = outputscale * K + noise * torch.eye(self.train_X.shape[0], **tkwargs)
+            pyro.sample(
+                "Y",
+                pyro.distributions.MultivariateNormal(
+                    loc=mean.view(-1).expand(self.train_X.shape[0]),
+                    covariance_matrix=K,
+                ),
+                obs=self.train_Y.squeeze(-1),
+            )
 
     def sample_outputscale(
         self, concentration: float = 2.0, rate: float = 0.15, **tkwargs: Any
@@ -244,8 +247,8 @@ class SaasPyroModel(PyroModel):
         return lengthscale
 
     def postprocess_mcmc_samples(
-        self, mcmc_samples: Dict[str, Tensor]
-    ) -> Dict[str, Tensor]:
+        self, mcmc_samples: dict[str, Tensor]
+    ) -> dict[str, Tensor]:
         r"""Post-process the MCMC samples.
 
         This computes the true lengthscales and removes the inverse lengthscales and
@@ -262,8 +265,8 @@ class SaasPyroModel(PyroModel):
         return mcmc_samples
 
     def load_mcmc_samples(
-        self, mcmc_samples: Dict[str, Tensor]
-    ) -> Tuple[Mean, Kernel, Likelihood]:
+        self, mcmc_samples: dict[str, Tensor]
+    ) -> tuple[Mean, Kernel, Likelihood]:
         r"""Load the MCMC samples into the mean_module, covar_module, and likelihood."""
         tkwargs = {"device": self.train_X.device, "dtype": self.train_X.dtype}
         num_mcmc_samples = len(mcmc_samples["mean"])
@@ -319,13 +322,16 @@ class SaasFullyBayesianSingleTaskGP(ExactGP, BatchedMultiOutputGPyTorchModel):
     with a Matern-5/2 kernel is used by default.
 
     You are expected to use `fit_fully_bayesian_model_nuts` to fit this model as it
-    isn't compatible with `fit_gpytorch_model`.
+    isn't compatible with `fit_gpytorch_mll`.
 
     Example:
         >>> saas_gp = SaasFullyBayesianSingleTaskGP(train_X, train_Y)
         >>> fit_fully_bayesian_model_nuts(saas_gp)
         >>> posterior = saas_gp.posterior(test_X)
     """
+
+    _is_fully_bayesian = True
+    _is_ensemble = True
 
     def __init__(
         self,
@@ -390,7 +396,7 @@ class SaasFullyBayesianSingleTaskGP(ExactGP, BatchedMultiOutputGPyTorchModel):
         pyro_model.set_inputs(
             train_X=transformed_X, train_Y=train_Y, train_Yvar=train_Yvar
         )
-        self.pyro_model = pyro_model
+        self.pyro_model: PyroModel = pyro_model
         if outcome_transform is not None:
             self.outcome_transform = outcome_transform
         if input_transform is not None:
@@ -440,7 +446,7 @@ class SaasFullyBayesianSingleTaskGP(ExactGP, BatchedMultiOutputGPyTorchModel):
             self.covar_module = None
             self.likelihood = None
 
-    def load_mcmc_samples(self, mcmc_samples: Dict[str, Tensor]) -> None:
+    def load_mcmc_samples(self, mcmc_samples: dict[str, Tensor]) -> None:
         r"""Load the MCMC hyperparameter samples into the model.
 
         This method will be called by `fit_fully_bayesian_model_nuts` when the model
@@ -495,20 +501,19 @@ class SaasFullyBayesianSingleTaskGP(ExactGP, BatchedMultiOutputGPyTorchModel):
         rest of this method will not run.
         """
         self._check_if_fitted()
-        x = X.unsqueeze(MCMC_DIM)
-        mean_x = self.mean_module(x)
-        covar_x = self.covar_module(x)
+        mean_x = self.mean_module(X)
+        covar_x = self.covar_module(X)
         return MultivariateNormal(mean_x, covar_x)
 
     # pyre-ignore[14]: Inconsistent override
     def posterior(
         self,
         X: Tensor,
-        output_indices: Optional[List[int]] = None,
+        output_indices: Optional[list[int]] = None,
         observation_noise: bool = False,
         posterior_transform: Optional[PosteriorTransform] = None,
         **kwargs: Any,
-    ) -> FullyBayesianPosterior:
+    ) -> GaussianMixturePosterior:
         r"""Computes the posterior over model outputs at the provided points.
 
         Args:
@@ -526,15 +531,50 @@ class SaasFullyBayesianSingleTaskGP(ExactGP, BatchedMultiOutputGPyTorchModel):
             posterior_transform: An optional PosteriorTransform.
 
         Returns:
-            A `FullyBayesianPosterior` object. Includes observation noise if specified.
+            A `GaussianMixturePosterior` object. Includes observation noise
+                if specified.
         """
         self._check_if_fitted()
         posterior = super().posterior(
-            X=X,
+            X=X.unsqueeze(MCMC_DIM),
             output_indices=output_indices,
             observation_noise=observation_noise,
             posterior_transform=posterior_transform,
             **kwargs,
         )
-        posterior = FullyBayesianPosterior(distribution=posterior.distribution)
+        posterior = GaussianMixturePosterior(distribution=posterior.distribution)
         return posterior
+
+    def condition_on_observations(
+        self, X: Tensor, Y: Tensor, **kwargs: Any
+    ) -> BatchedMultiOutputGPyTorchModel:
+        """Conditions on additional observations for a Fully Bayesian model (either
+        identical across models or unique per-model).
+
+        Args:
+            X: A `batch_shape x num_samples x d`-dim Tensor, where `d` is
+                the dimension of the feature space and `batch_shape` is the number of
+                sampled models.
+            Y: A `batch_shape x num_samples x 1`-dim Tensor, where `d` is
+                the dimension of the feature space and `batch_shape` is the number of
+                sampled models.
+
+        Returns:
+            BatchedMultiOutputGPyTorchModel: A fully bayesian model conditioned on
+              given observations. The returned model has `batch_shape` copies of the
+              training data in case of identical observations (and `batch_shape`
+              training datasets otherwise).
+        """
+        if X.ndim == 2 and Y.ndim == 2:
+            # To avoid an error in GPyTorch when inferring the batch dimension, we add
+            # the explicit batch shape here. The result is that the conditioned model
+            # will have 'batch_shape' copies of the training data.
+            X = X.repeat(self.batch_shape + (1, 1))
+            Y = Y.repeat(self.batch_shape + (1, 1))
+
+        elif X.ndim < Y.ndim:
+            # We need to duplicate the training data to enable correct batch
+            # size inference in gpytorch.
+            X = X.repeat(*(Y.shape[:-2] + (1, 1)))
+
+        return super().condition_on_observations(X, Y, **kwargs)

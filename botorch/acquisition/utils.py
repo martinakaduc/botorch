@@ -11,260 +11,86 @@ Utilities for acquisition functions.
 from __future__ import annotations
 
 import math
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Callable, Optional
 
 import torch
-from botorch.acquisition import analytic, monte_carlo, multi_objective  # noqa F401
-from botorch.acquisition.acquisition import AcquisitionFunction
-from botorch.acquisition.multi_objective import monte_carlo as moo_monte_carlo
 from botorch.acquisition.objective import (
     IdentityMCObjective,
     MCAcquisitionObjective,
     PosteriorTransform,
 )
-from botorch.exceptions.errors import UnsupportedError
+from botorch.exceptions.errors import (
+    BotorchTensorDimensionError,
+    DeprecationError,
+    UnsupportedError,
+)
 from botorch.models.fully_bayesian import MCMC_DIM
 from botorch.models.model import Model
 from botorch.sampling.base import MCSampler
 from botorch.sampling.get_sampler import get_sampler
 from botorch.sampling.pathwise import draw_matheron_paths
-from botorch.utils.multi_objective.box_decompositions.non_dominated import (
-    FastNondominatedPartitioning,
-    NondominatedPartitioning,
-)
 from botorch.utils.objective import compute_feasibility_indicator
 from botorch.utils.sampling import optimize_posterior_samples
-from botorch.utils.transforms import is_fully_bayesian
+from botorch.utils.transforms import is_ensemble, normalize_indices
 from torch import Tensor
 
 
-def get_acquisition_function(
-    acquisition_function_name: str,
-    model: Model,
-    objective: MCAcquisitionObjective,
-    X_observed: Tensor,
-    posterior_transform: Optional[PosteriorTransform] = None,
-    X_pending: Optional[Tensor] = None,
-    constraints: Optional[List[Callable[[Tensor], Tensor]]] = None,
-    eta: Optional[Union[Tensor, float]] = 1e-3,
-    mc_samples: int = 512,
-    seed: Optional[int] = None,
-    **kwargs,
-) -> monte_carlo.MCAcquisitionFunction:
-    r"""Convenience function for initializing botorch acquisition functions.
+def get_acquisition_function(*args, **kwargs) -> None:
+    raise DeprecationError(
+        "`get_acquisition_function` has been moved to `botorch.acquisition.factory`."
+    )
+
+
+def repeat_to_match_aug_dim(target_tensor: Tensor, reference_tensor: Tensor) -> Tensor:
+    """Repeat target_tensor until it has the same first dimension as reference_tensor
+    This works regardless of the batch shapes and q.
+    This is useful as we sometimes modify sample shapes such as in LearnedObjective.
 
     Args:
-        acquisition_function_name: Name of the acquisition function.
-        model: A fitted model.
-        objective: A MCAcquisitionObjective.
-        X_observed: A `m1 x d`-dim Tensor of `m1` design points that have
-            already been observed.
-        posterior_transform: A PosteriorTransform (optional).
-        X_pending: A `m2 x d`-dim Tensor of `m2` design points whose evaluation
-            is pending.
-        constraints: A list of callables, each mapping a Tensor of dimension
-            `sample_shape x batch-shape x q x m` to a Tensor of dimension
-            `sample_shape x batch-shape x q`, where negative values imply
-            feasibility. Used for all acquisition functions except qSR and qUCB.
-        eta: The temperature parameter for the sigmoid function used for the
-            differentiable approximation of the constraints. In case of a float the
-            same eta is used for every constraint in constraints. In case of a
-            tensor the length of the tensor must match the number of provided
-            constraints. The i-th constraint is then estimated with the i-th
-            eta value. Used for all acquisition functions except qSR and qUCB.
-        mc_samples: The number of samples to use for (q)MC evaluation of the
-            acquisition function.
-        seed: If provided, perform deterministic optimization (i.e. the
-            function to optimize is fixed and not stochastic).
+        target_tensor: A `sample_size x batch_shape x q x m`-dim Tensor
+        reference_tensor: A `(augmented_sample * sample_size) x batch_shape x q`-dim
+            Tensor. `augmented_sample` could be 1.
 
     Returns:
-        The requested acquisition function.
+        The content of `target_tensor` potentially repeated so that its first dimension
+        matches that of `reference_tensor`.
+        The shape will be `(augmented_sample * sample_size) x batch_shape x q x m`.
 
-    Example:
-        >>> model = SingleTaskGP(train_X, train_Y)
-        >>> obj = LinearMCObjective(weights=torch.tensor([1.0, 2.0]))
-        >>> acqf = get_acquisition_function("qEI", model, obj, train_X)
+    Examples:
+        >>> import torch
+        >>> target_tensor = torch.arange(3).repeat(2, 1).T
+        >>> target_tensor
+        tensor([[0, 0],
+                [1, 1],
+                [2, 2]])
+        >>> repeat_to_match_aug_dim(target_tensor, torch.zeros(6))
+        tensor([[0, 0],
+                [1, 1],
+                [2, 2],
+                [0, 0],
+                [1, 1],
+                [2, 2]])
     """
-    # initialize the sampler
-    sampler = get_sampler(
-        posterior=model.posterior(X_observed[:1]),
-        sample_shape=torch.Size([mc_samples]),
-        seed=seed,
+    augmented_sample_num, remainder = divmod(
+        reference_tensor.shape[0], target_tensor.shape[0]
     )
-    if posterior_transform is not None and acquisition_function_name in [
-        "qEHVI",
-        "qNEHVI",
-    ]:
-        raise NotImplementedError(
-            "PosteriorTransforms are not yet implemented for multi-objective "
-            "acquisition functions."
+    if remainder != 0:
+        raise ValueError(
+            "The first dimension of reference_tensor must "
+            "be a multiple of target_tensor's."
         )
-    # instantiate and return the requested acquisition function
-    if acquisition_function_name in ("qEI", "qLogEI", "qPI"):
-        # Since these are the non-noisy variants, use the posterior mean at the observed
-        # inputs directly to compute the best feasible value without sampling.
-        Y = model.posterior(X_observed, posterior_transform=posterior_transform).mean
-        obj = objective(samples=Y, X=X_observed)
-        best_f = compute_best_feasible_objective(
-            samples=Y,
-            obj=obj,
-            constraints=constraints,
-            model=model,
-            objective=objective,
-            posterior_transform=posterior_transform,
-            X_baseline=X_observed,
-        )
-    if acquisition_function_name == "qEI":
-        return monte_carlo.qExpectedImprovement(
-            model=model,
-            best_f=best_f,
-            sampler=sampler,
-            objective=objective,
-            posterior_transform=posterior_transform,
-            X_pending=X_pending,
-            constraints=constraints,
-            eta=eta,
-        )
-    if acquisition_function_name == "qLogEI":
-        # putting the import here to avoid circular imports
-        # ideally, the entire function should be moved out of this file,
-        # but since it is used for legacy code to be deprecated, we keep it here.
-        from botorch.acquisition.logei import qLogExpectedImprovement
 
-        return qLogExpectedImprovement(
-            model=model,
-            best_f=best_f,
-            sampler=sampler,
-            objective=objective,
-            posterior_transform=posterior_transform,
-            X_pending=X_pending,
-            constraints=constraints,
-            eta=eta,
-        )
-    elif acquisition_function_name == "qPI":
-        return monte_carlo.qProbabilityOfImprovement(
-            model=model,
-            best_f=best_f,
-            sampler=sampler,
-            objective=objective,
-            posterior_transform=posterior_transform,
-            X_pending=X_pending,
-            tau=kwargs.get("tau", 1e-3),
-            constraints=constraints,
-            eta=eta,
-        )
-    elif acquisition_function_name == "qNEI":
-        return monte_carlo.qNoisyExpectedImprovement(
-            model=model,
-            X_baseline=X_observed,
-            sampler=sampler,
-            objective=objective,
-            posterior_transform=posterior_transform,
-            X_pending=X_pending,
-            prune_baseline=kwargs.get("prune_baseline", True),
-            marginalize_dim=kwargs.get("marginalize_dim"),
-            cache_root=kwargs.get("cache_root", True),
-            constraints=constraints,
-            eta=eta,
-        )
-    elif acquisition_function_name == "qLogNEI":
-        from botorch.acquisition.logei import qLogNoisyExpectedImprovement
-
-        return qLogNoisyExpectedImprovement(
-            model=model,
-            X_baseline=X_observed,
-            sampler=sampler,
-            objective=objective,
-            posterior_transform=posterior_transform,
-            X_pending=X_pending,
-            prune_baseline=kwargs.get("prune_baseline", True),
-            marginalize_dim=kwargs.get("marginalize_dim"),
-            cache_root=kwargs.get("cache_root", True),
-            constraints=constraints,
-            eta=eta,
-        )
-    elif acquisition_function_name == "qSR":
-        return monte_carlo.qSimpleRegret(
-            model=model,
-            sampler=sampler,
-            objective=objective,
-            posterior_transform=posterior_transform,
-            X_pending=X_pending,
-        )
-    elif acquisition_function_name == "qUCB":
-        if "beta" not in kwargs:
-            raise ValueError("`beta` must be specified in kwargs for qUCB.")
-        return monte_carlo.qUpperConfidenceBound(
-            model=model,
-            beta=kwargs["beta"],
-            sampler=sampler,
-            objective=objective,
-            posterior_transform=posterior_transform,
-            X_pending=X_pending,
-        )
-    elif acquisition_function_name == "qEHVI":
-        # pyre-fixme [16]: `Model` has no attribute `train_targets`
-        try:
-            ref_point = kwargs["ref_point"]
-        except KeyError:
-            raise ValueError("`ref_point` must be specified in kwargs for qEHVI")
-        try:
-            Y = kwargs["Y"]
-        except KeyError:
-            raise ValueError("`Y` must be specified in kwargs for qEHVI")
-        # get feasible points
-        if constraints is not None:
-            feas = torch.stack([c(Y) <= 0 for c in constraints], dim=-1).all(dim=-1)
-            Y = Y[feas]
-        obj = objective(Y)
-        alpha = kwargs.get("alpha", 0.0)
-        if alpha > 0:
-            partitioning = NondominatedPartitioning(
-                ref_point=torch.as_tensor(ref_point, dtype=Y.dtype, device=Y.device),
-                Y=obj,
-                alpha=alpha,
-            )
-        else:
-            partitioning = FastNondominatedPartitioning(
-                ref_point=torch.as_tensor(ref_point, dtype=Y.dtype, device=Y.device),
-                Y=obj,
-            )
-        return moo_monte_carlo.qExpectedHypervolumeImprovement(
-            model=model,
-            ref_point=ref_point,
-            partitioning=partitioning,
-            sampler=sampler,
-            objective=objective,
-            constraints=constraints,
-            eta=eta,
-            X_pending=X_pending,
-        )
-    elif acquisition_function_name == "qNEHVI":
-        if "ref_point" not in kwargs:
-            raise ValueError("`ref_point` must be specified in kwargs for qNEHVI")
-        return moo_monte_carlo.qNoisyExpectedHypervolumeImprovement(
-            model=model,
-            ref_point=kwargs["ref_point"],
-            X_baseline=X_observed,
-            sampler=sampler,
-            objective=objective,
-            constraints=constraints,
-            eta=eta,
-            prune_baseline=kwargs.get("prune_baseline", True),
-            alpha=kwargs.get("alpha", 0.0),
-            X_pending=X_pending,
-            marginalize_dim=kwargs.get("marginalize_dim"),
-            cache_root=kwargs.get("cache_root", True),
-        )
-    raise NotImplementedError(
-        f"Unknown acquisition function {acquisition_function_name}"
-    )
+    # using repeat here as obj might be constructed as
+    # obj.reshape(-1, *samples.shape[2:]) where the first 2 dimensions are
+    # of shape `augmented_samples x sample_shape`.
+    repeat_size = (augmented_sample_num,) + (1,) * (target_tensor.ndim - 1)
+    return target_tensor.repeat(*repeat_size)
 
 
 def compute_best_feasible_objective(
     samples: Tensor,
     obj: Tensor,
-    constraints: Optional[List[Callable[[Tensor], Tensor]]],
+    constraints: Optional[list[Callable[[Tensor], Tensor]]],
     model: Optional[Model] = None,
     objective: Optional[MCAcquisitionObjective] = None,
     posterior_transform: Optional[PosteriorTransform] = None,
@@ -295,24 +121,23 @@ def compute_best_feasible_objective(
         infeasible_obj: A Tensor to be returned when no feasible points exist.
 
     Returns:
-        A `(sample_shape) x batch_shape x 1`-dim Tensor of best feasible objectives.
+        A `(sample_shape) x batch_shape`-dim Tensor of best feasible objectives.
     """
     if constraints is None:  # unconstrained case
         # we don't need to differentiate through X_baseline for now, so taking
         # the regular max over the n points to get best_f is fine
         with torch.no_grad():
-            return obj.amax(dim=-1, keepdim=True)
+            return obj.amax(dim=-1, keepdim=False)
 
     is_feasible = compute_feasibility_indicator(
         constraints=constraints, samples=samples
     )  # sample_shape x batch_shape x q
-    if is_feasible.any():
-        obj = torch.where(is_feasible, obj, -torch.inf)
-        with torch.no_grad():
-            return obj.amax(dim=-1, keepdim=True)
+
+    if is_feasible.any(dim=-1).all():
+        infeasible_value = -torch.inf
 
     elif infeasible_obj is not None:
-        return infeasible_obj.expand(*obj.shape[:-1], 1)
+        infeasible_value = infeasible_obj.item()
 
     else:
         if model is None:
@@ -323,12 +148,19 @@ def compute_best_feasible_objective(
             raise ValueError(
                 "Must specify `X_baseline` when no feasible observation exists."
             )
-        return _estimate_objective_lower_bound(
+        infeasible_value = _estimate_objective_lower_bound(
             model=model,
             objective=objective,
             posterior_transform=posterior_transform,
             X=X_baseline,
-        ).expand(*obj.shape[:-1], 1)
+        ).item()
+
+    is_feasible = repeat_to_match_aug_dim(
+        target_tensor=is_feasible, reference_tensor=obj
+    )
+    obj = torch.where(is_feasible, obj, infeasible_value)
+    with torch.no_grad():
+        return obj.amax(dim=-1, keepdim=False)
 
 
 def _estimate_objective_lower_bound(
@@ -410,42 +242,12 @@ def get_infeasible_cost(
     return -(lb.clamp_max(0.0))
 
 
-def is_nonnegative(acq_function: AcquisitionFunction) -> bool:
-    r"""Determine whether a given acquisition function is non-negative.
-
-    Args:
-        acq_function: The `AcquisitionFunction` instance.
-
-    Returns:
-        True if `acq_function` is non-negative, False if not, or if the behavior
-        is unknown (for custom acquisition functions).
-
-    Example:
-        >>> qEI = qExpectedImprovement(model, best_f=0.1)
-        >>> is_nonnegative(qEI)  # returns True
-    """
-    return isinstance(
-        acq_function,
-        (
-            analytic.ExpectedImprovement,
-            analytic.ConstrainedExpectedImprovement,
-            analytic.ProbabilityOfImprovement,
-            analytic.NoisyExpectedImprovement,
-            monte_carlo.qExpectedImprovement,
-            monte_carlo.qNoisyExpectedImprovement,
-            monte_carlo.qProbabilityOfImprovement,
-            multi_objective.analytic.ExpectedHypervolumeImprovement,
-            multi_objective.monte_carlo.qExpectedHypervolumeImprovement,
-            multi_objective.monte_carlo.qNoisyExpectedHypervolumeImprovement,
-        ),
-    )
-
-
 def prune_inferior_points(
     model: Model,
     X: Tensor,
     objective: Optional[MCAcquisitionObjective] = None,
     posterior_transform: Optional[PosteriorTransform] = None,
+    constraints: Optional[list[Callable[[Tensor], Tensor]]] = None,
     num_samples: int = 2048,
     max_frac: float = 1.0,
     sampler: Optional[MCSampler] = None,
@@ -465,6 +267,10 @@ def prune_inferior_points(
             supported.
         objective: The objective under which to evaluate the posterior.
         posterior_transform: A PosteriorTransform (optional).
+        constraints: A list of constraint callables which map a Tensor of posterior
+            samples of dimension `sample_shape x batch-shape x q x m`-dim to a
+            `sample_shape x batch-shape x q`-dim Tensor. The associated constraints
+            are satisfied if `constraint(samples) < 0`.
         num_samples: The number of samples used to compute empirical
             probabilities of being the best point.
         max_frac: The maximum fraction of points to retain. Must satisfy
@@ -484,7 +290,7 @@ def prune_inferior_points(
         with `N_nz` the number of points in `X` that have non-zero (empirical,
         under `num_samples` samples) probability of being the best point.
     """
-    if marginalize_dim is None and is_fully_bayesian(model):
+    if marginalize_dim is None and is_ensemble(model):
         # TODO: Properly deal with marginalizing fully Bayesian models
         marginalize_dim = MCMC_DIM
 
@@ -493,9 +299,11 @@ def prune_inferior_points(
         raise UnsupportedError(
             "Batched inputs `X` are currently unsupported by prune_inferior_points"
         )
-    max_points = math.ceil(max_frac * X.size(-2))
-    if max_points < 1 or max_points > X.size(-2):
+    if X.size(-2) == 0:
+        raise ValueError("X must have at least one point.")
+    if max_frac <= 0 or max_frac > 1.0:
         raise ValueError(f"max_frac must take values in (0, 1], is {max_frac}")
+    max_points = math.ceil(max_frac * X.size(-2))
     with torch.no_grad():
         posterior = model.posterior(X=X, posterior_transform=posterior_transform)
     if sampler is None:
@@ -508,6 +316,12 @@ def prune_inferior_points(
     obj_vals = objective(samples, X=X)
     if obj_vals.ndim > 2:
         if obj_vals.ndim == 3 and marginalize_dim is not None:
+            if marginalize_dim < 0:
+                # we do this again in compute_feasibility_indicator, but that will
+                # have no effect since marginalize_dim will be non-negative
+                marginalize_dim = (
+                    1 + normalize_indices([marginalize_dim], d=obj_vals.ndim)[0]
+                )
             obj_vals = obj_vals.mean(dim=marginalize_dim)
         else:
             # TODO: support batched inputs (req. dealing with ragged tensors)
@@ -515,6 +329,16 @@ def prune_inferior_points(
                 "Models with multiple batch dims are currently unsupported by"
                 " prune_inferior_points."
             )
+    infeas = ~compute_feasibility_indicator(
+        constraints=constraints,
+        samples=samples,
+        marginalize_dim=marginalize_dim,
+    )
+    if infeas.any():
+        # set infeasible points to worse than worst objective
+        # across all samples
+        obj_vals[infeas] = obj_vals.min() - 1
+
     is_best = torch.argmax(obj_vals, dim=-1)
     idcs, counts = torch.unique(is_best, return_counts=True)
 
@@ -526,21 +350,28 @@ def prune_inferior_points(
 
 
 def project_to_target_fidelity(
-    X: Tensor, target_fidelities: Optional[Dict[int, float]] = None
+    X: Tensor,
+    target_fidelities: Optional[dict[int, float]] = None,
+    d: Optional[int] = None,
 ) -> Tensor:
     r"""Project `X` onto the target set of fidelities.
 
     This function assumes that the set of feasible fidelities is a box, so
     projecting here just means setting each fidelity parameter to its target
-    value.
+    value. If X does not contain the fidelity dimensions, this will insert
+    them and set them to their target values.
 
     Args:
-        X: A `batch_shape x q x d`-dim Tensor of with `q` `d`-dim design points
-            for each t-batch.
+        X: A `batch_shape x q x (d or d-d_f)`-dim Tensor of with `q` `d` or
+            `d-d_f`-dim design points for each t-batch, where d_f is the
+            number of fidelity dimensions. If the argument `d` is not provided,
+            `X` must include the fidelity dimensions and have a trailing`X` must
+            include the fidelity dimensions and have a trailing
         target_fidelities: A dictionary mapping a subset of columns of `X` (the
             fidelity parameters) to their respective target fidelity value. If
             omitted, assumes that the last column of X is the fidelity parameter
             with a target value of 1.0.
+        d: The total dimension `d`.
 
     Return:
         A `batch_shape x q x d`-dim Tensor `X_proj` with fidelity parameters
@@ -548,20 +379,41 @@ def project_to_target_fidelity(
     """
     if target_fidelities is None:
         target_fidelities = {-1: 1.0}
-    d = X.size(-1)
+    if d is None:
+        # assume X contains the fidelity dimensions
+        d = X.shape[-1]
     # normalize to positive indices
     tfs = {k if k >= 0 else d + k: v for k, v in target_fidelities.items()}
     ones = torch.ones(*X.shape[:-1], device=X.device, dtype=X.dtype)
-    # here we're looping through the feature dimension of X - this could be
-    # slow for large `d`, we should optimize this for that case
-    X_proj = torch.stack(
-        [X[..., i] if i not in tfs else tfs[i] * ones for i in range(d)], dim=-1
-    )
+    if X.shape[-1] == d:
+        # X contains fidelity dimensions
+        # here we're looping through the feature dimension of X - this could be
+        # slow for large `d`, we should optimize this for that case
+        X_proj = torch.stack(
+            [X[..., i] if i not in tfs else tfs[i] * ones for i in range(d)], dim=-1
+        )
+    elif X.shape[-1] == d - len(target_fidelities):
+        # need to insert fidelity dimensions
+        cols = []
+        X_idx = 0
+        for i in range(d):
+            if i not in tfs:
+                cols.append(X[..., X_idx])
+                X_idx += 1
+            else:
+                cols.append(tfs[i] * ones)
+        X_proj = torch.stack(cols, dim=-1)
+    else:
+        raise BotorchTensorDimensionError(
+            "X must have a last dimension with size `d` or `d-d_f`,"
+            f" but got {X.shape[-1]}."
+        )
+
     return X_proj
 
 
 def expand_trace_observations(
-    X: Tensor, fidelity_dims: Optional[List[int]] = None, num_trace_obs: int = 0
+    X: Tensor, fidelity_dims: Optional[list[int]] = None, num_trace_obs: int = 0
 ) -> Tensor:
     r"""Expand `X` with trace observations.
 
@@ -639,7 +491,7 @@ def get_optimal_samples(
     raw_samples: int = 1024,
     num_restarts: int = 20,
     maximize: bool = True,
-) -> Tuple[Tensor, Tensor]:
+) -> tuple[Tensor, Tensor]:
     """Draws sample paths from the posterior and maximizes the samples using GD.
 
     Args:

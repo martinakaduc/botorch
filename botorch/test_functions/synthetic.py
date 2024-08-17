@@ -32,35 +32,49 @@ References:
     Silva. Constrained optimization problems in mechanical engineering design
     using a real-coded steady-state genetic algorithm. Mecánica Computacional,
     XXIX:9287–9303, 2010.
+
+.. [Letham2019]
+    B. Letham, B. Karrer, G. Ottoni, and E. Bakshy. Constrained Bayesian
+    Optimization with Noisy Experiments. Bayesian Analysis, Bayesian Anal.
+    14(2), 495-519, 2019.
+
+.. [Gramacy2016]
+    R. Gramacy, G. Gray, S. Le Digabel, H. Lee, P. Ranjan, G. Wells & S. Wild.
+    Modeling an Augmented Lagrangian for Blackbox Constrained Optimization,
+    Technometrics, 2016.
 """
 
 from __future__ import annotations
 
 import math
-from typing import List, Optional, Tuple
+from abc import ABC
+from typing import Optional, Union
 
 import torch
+from botorch.exceptions.errors import InputDataError
 from botorch.test_functions.base import BaseTestProblem, ConstrainedBaseTestProblem
 from botorch.test_functions.utils import round_nearest
 from torch import Tensor
 
 
-class SyntheticTestFunction(BaseTestProblem):
+class SyntheticTestFunction(BaseTestProblem, ABC):
     r"""Base class for synthetic test functions."""
 
-    _optimal_value: float
-    _optimizers: Optional[List[Tuple[float, ...]]] = None
+    _optimal_value: Optional[float] = None
+    _optimizers: Optional[list[tuple[float, ...]]] = None
     num_objectives: int = 1
 
     def __init__(
         self,
-        noise_std: Optional[float] = None,
+        noise_std: Union[None, float, list[float]] = None,
         negate: bool = False,
-        bounds: Optional[List[Tuple[float, float]]] = None,
+        bounds: Optional[list[tuple[float, float]]] = None,
     ) -> None:
         r"""
         Args:
-            noise_std: Standard deviation of the observation noise.
+            noise_std: Standard deviation of the observation noise. If a list is
+                provided, specifies separate noise standard deviations for each
+                objective in a multiobjective problem.
             negate: If True, negate the function.
             bounds: Custom bounds for the function specified as (lower, upper) pairs.
         """
@@ -71,7 +85,7 @@ class SyntheticTestFunction(BaseTestProblem):
             if bounds is not None:
                 # Ensure at least one optimizer lies within the custom bounds
                 def in_bounds(
-                    optimizer: Tuple[float, ...], bounds: List[Tuple[float, float]]
+                    optimizer: tuple[float, ...], bounds: list[tuple[float, float]]
                 ) -> bool:
                     for i, xopt in enumerate(optimizer):
                         lower, upper = bounds[i]
@@ -90,13 +104,18 @@ class SyntheticTestFunction(BaseTestProblem):
                         f"`{self.__class__.__name__}._optimizers`."
                     )
             self.register_buffer(
-                "optimizers", torch.tensor(self._optimizers, dtype=torch.float)
+                "optimizers", torch.tensor(self._optimizers, dtype=self.bounds.dtype)
             )
 
     @property
     def optimal_value(self) -> float:
         r"""The global minimum (maximum if negate=True) of the function."""
-        return -self._optimal_value if self.negate else self._optimal_value
+        if self._optimal_value is not None:
+            return -self._optimal_value if self.negate else self._optimal_value
+        else:
+            raise NotImplementedError(
+                f"Problem {self.__class__.__name__} does not specify an optimal value."
+            )
 
 
 class Ackley(SyntheticTestFunction):
@@ -119,7 +138,7 @@ class Ackley(SyntheticTestFunction):
         dim: int = 2,
         noise_std: Optional[float] = None,
         negate: bool = False,
-        bounds: Optional[List[Tuple[float, float]]] = None,
+        bounds: Optional[list[tuple[float, float]]] = None,
     ) -> None:
         r"""
         Args:
@@ -139,7 +158,7 @@ class Ackley(SyntheticTestFunction):
 
     def evaluate_true(self, X: Tensor) -> Tensor:
         a, b, c = self.a, self.b, self.c
-        part1 = -a * torch.exp(-b / math.sqrt(self.dim) * torch.norm(X, dim=-1))
+        part1 = -a * torch.exp(-b / math.sqrt(self.dim) * torch.linalg.norm(X, dim=-1))
         part2 = -(torch.exp(torch.mean(torch.cos(c * X), dim=-1)))
         return part1 + part2 + a + math.e
 
@@ -153,9 +172,9 @@ class Beale(SyntheticTestFunction):
 
     def evaluate_true(self, X: Tensor) -> Tensor:
         x1, x2 = X[..., 0], X[..., 1]
-        part1 = (1.5 - x1 + x1 * x2) ** 2
-        part2 = (2.25 - x1 + x1 * x2**2) ** 2
-        part3 = (2.625 - x1 + x1 * x2**3) ** 2
+        part1 = (1.5 - x1 + x1 * x2).pow(2)
+        part2 = (2.25 - x1 + x1 * x2.pow(2)).pow(2)
+        part3 = (2.625 - x1 + x1 * x2.pow(3)).pow(2)
         return part1 + part2 + part3
 
 
@@ -180,12 +199,12 @@ class Branin(SyntheticTestFunction):
     def evaluate_true(self, X: Tensor) -> Tensor:
         t1 = (
             X[..., 1]
-            - 5.1 / (4 * math.pi**2) * X[..., 0] ** 2
+            - 5.1 / (4 * math.pi**2) * X[..., 0].pow(2)
             + 5 / math.pi * X[..., 0]
             - 6
         )
         t2 = 10 * (1 - 1 / (8 * math.pi)) * torch.cos(X[..., 0])
-        return t1**2 + t2 + 10
+        return t1.pow(2) + t2 + 10
 
 
 class Bukin(SyntheticTestFunction):
@@ -197,7 +216,7 @@ class Bukin(SyntheticTestFunction):
     _check_grad_at_opt: bool = False
 
     def evaluate_true(self, X: Tensor) -> Tensor:
-        part1 = 100.0 * torch.sqrt(torch.abs(X[..., 1] - 0.01 * X[..., 0] ** 2))
+        part1 = 100.0 * torch.sqrt(torch.abs(X[..., 1] - 0.01 * X[..., 0].pow(2)))
         part2 = 0.01 * torch.abs(X[..., 0] + 10.0)
         return part1 + part2
 
@@ -219,7 +238,7 @@ class Cosine8(SyntheticTestFunction):
     _optimizers = [tuple(0.0 for _ in range(8))]
 
     def evaluate_true(self, X: Tensor) -> Tensor:
-        return torch.sum(0.1 * torch.cos(5 * math.pi * X) - X**2, dim=-1)
+        return torch.sum(0.1 * torch.cos(5 * math.pi * X) - X.pow(2), dim=-1)
 
 
 class DropWave(SyntheticTestFunction):
@@ -231,7 +250,7 @@ class DropWave(SyntheticTestFunction):
     _check_grad_at_opt = False
 
     def evaluate_true(self, X: Tensor) -> Tensor:
-        norm = torch.norm(X, dim=-1)
+        norm = torch.linalg.norm(X, dim=-1)
         part1 = 1.0 + torch.cos(12.0 * norm)
         part2 = 0.5 * norm.pow(2) + 2.0
         return -part1 / part2
@@ -246,7 +265,7 @@ class DixonPrice(SyntheticTestFunction):
         dim=2,
         noise_std: Optional[float] = None,
         negate: bool = False,
-        bounds: Optional[List[Tuple[float, float]]] = None,
+        bounds: Optional[list[tuple[float, float]]] = None,
     ) -> None:
         r"""
         Args:
@@ -267,9 +286,9 @@ class DixonPrice(SyntheticTestFunction):
 
     def evaluate_true(self, X: Tensor) -> Tensor:
         d = self.dim
-        part1 = (X[..., 0] - 1) ** 2
+        part1 = (X[..., 0] - 1).pow(2)
         i = X.new(range(2, d + 1))
-        part2 = torch.sum(i * (2.0 * X[..., 1:] ** 2 - X[..., :-1]) ** 2, dim=-1)
+        part2 = torch.sum(i * (2.0 * X[..., 1:].pow(2) - X[..., :-1]).pow(2), dim=-1)
         return part1 + part2
 
 
@@ -297,6 +316,16 @@ class EggHolder(SyntheticTestFunction):
 
 
 class Griewank(SyntheticTestFunction):
+    r"""Griewank synthetic test function.
+
+    The Griewank function is defined for any `d`, is typically evaluated on
+    `[-600, 600]^d`, and given by:
+
+        G(x) = sum_{i=1}^d x_i**2 / 4000 - prod_{i=1}^d cos(x_i / sqrt(i)) + 1
+
+    G has many widespread local minima, which are regularly distributed.
+    The global minimum is at `z = (0, ..., 0)` with `G(z) = 0`.
+    """
 
     _optimal_value = 0.0
 
@@ -305,7 +334,7 @@ class Griewank(SyntheticTestFunction):
         dim=2,
         noise_std: Optional[float] = None,
         negate: bool = False,
-        bounds: Optional[List[Tuple[float, float]]] = None,
+        bounds: Optional[list[tuple[float, float]]] = None,
     ) -> None:
         r"""
         Args:
@@ -321,7 +350,7 @@ class Griewank(SyntheticTestFunction):
         super().__init__(noise_std=noise_std, negate=negate, bounds=bounds)
 
     def evaluate_true(self, X: Tensor) -> Tensor:
-        part1 = torch.sum(X**2 / 4000.0, dim=-1)
+        part1 = torch.sum(X.pow(2) / 4000.0, dim=-1)
         d = X.shape[-1]
         part2 = -(torch.prod(torch.cos(X / torch.sqrt(X.new(range(1, d + 1)))), dim=-1))
         return part1 + part2 + 1.0
@@ -347,7 +376,7 @@ class Hartmann(SyntheticTestFunction):
         dim=6,
         noise_std: Optional[float] = None,
         negate: bool = False,
-        bounds: Optional[List[Tuple[float, float]]] = None,
+        bounds: Optional[list[tuple[float, float]]] = None,
     ) -> None:
         r"""
         Args:
@@ -377,7 +406,7 @@ class Hartmann(SyntheticTestFunction):
                 [3689, 1170, 2673],
                 [4699, 4387, 7470],
                 [1091, 8732, 5547],
-                [381, 5743, 8828],
+                [381, 5743, 8828.0],
             ]
         elif dim == 4:
             A = [
@@ -387,7 +416,7 @@ class Hartmann(SyntheticTestFunction):
                 [17, 8, 0.05, 10],
             ]
             P = [
-                [1312, 1696, 5569, 124],
+                [1312, 1696, 5569, 124.0],
                 [2329, 4135, 8307, 3736],
                 [2348, 1451, 3522, 2883],
                 [4047, 8828, 8732, 5743],
@@ -403,16 +432,12 @@ class Hartmann(SyntheticTestFunction):
                 [1312, 1696, 5569, 124, 8283, 5886],
                 [2329, 4135, 8307, 3736, 1004, 9991],
                 [2348, 1451, 3522, 2883, 3047, 6650],
-                [4047, 8828, 8732, 5743, 1091, 381],
+                [4047, 8828, 8732, 5743, 1091, 381.0],
             ]
-        self.register_buffer("A", torch.tensor(A, dtype=torch.float))
-        self.register_buffer("P", torch.tensor(P, dtype=torch.float))
-
-    @property
-    def optimal_value(self) -> float:
-        if self.dim == 4:
-            raise NotImplementedError()
-        return super().optimal_value
+        else:  # pragma: no cover -- unreacheable code for pyre.
+            raise NotImplementedError
+        self.register_buffer("A", torch.tensor(A))
+        self.register_buffer("P", torch.tensor(P))
 
     @property
     def optimizers(self) -> Tensor:
@@ -422,7 +447,9 @@ class Hartmann(SyntheticTestFunction):
 
     def evaluate_true(self, X: Tensor) -> Tensor:
         self.to(device=X.device, dtype=X.dtype)
-        inner_sum = torch.sum(self.A * (X.unsqueeze(-2) - 0.0001 * self.P) ** 2, dim=-1)
+        inner_sum = torch.sum(
+            self.A * (X.unsqueeze(-2) - 0.0001 * self.P).pow(2), dim=-1
+        )
         H = -(torch.sum(self.ALPHA * torch.exp(-inner_sum), dim=-1))
         if self.dim == 4:
             H = (1.1 + H) / 0.839
@@ -455,7 +482,7 @@ class HolderTable(SyntheticTestFunction):
     ]
 
     def evaluate_true(self, X: Tensor) -> Tensor:
-        term = torch.abs(1 - torch.norm(X, dim=-1) / math.pi)
+        term = torch.abs(1 - torch.linalg.norm(X, dim=-1) / math.pi)
         return -(
             torch.abs(torch.sin(X[..., 0]) * torch.cos(X[..., 1]) * torch.exp(term))
         )
@@ -483,7 +510,7 @@ class Levy(SyntheticTestFunction):
         dim=2,
         noise_std: Optional[float] = None,
         negate: bool = False,
-        bounds: Optional[List[Tuple[float, float]]] = None,
+        bounds: Optional[list[tuple[float, float]]] = None,
     ) -> None:
         r"""
         Args:
@@ -500,14 +527,14 @@ class Levy(SyntheticTestFunction):
 
     def evaluate_true(self, X: Tensor) -> Tensor:
         w = 1.0 + (X - 1.0) / 4.0
-        part1 = torch.sin(math.pi * w[..., 0]) ** 2
+        part1 = torch.sin(math.pi * w[..., 0]).pow(2)
         part2 = torch.sum(
-            (w[..., :-1] - 1.0) ** 2
-            * (1.0 + 10.0 * torch.sin(math.pi * w[..., :-1] + 1.0) ** 2),
+            (w[..., :-1] - 1.0).pow(2)
+            * (1.0 + 10.0 * torch.sin(math.pi * w[..., :-1] + 1.0).pow(2)),
             dim=-1,
         )
-        part3 = (w[..., -1] - 1.0) ** 2 * (
-            1.0 + torch.sin(2.0 * math.pi * w[..., -1]) ** 2
+        part3 = (w[..., -1] - 1.0).pow(2) * (
+            1.0 + torch.sin(2.0 * math.pi * w[..., -1]).pow(2)
         )
         return part1 + part2 + part3
 
@@ -525,7 +552,7 @@ class Michalewicz(SyntheticTestFunction):
         dim=2,
         noise_std: Optional[float] = None,
         negate: bool = False,
-        bounds: Optional[List[Tuple[float, float]]] = None,
+        bounds: Optional[list[tuple[float, float]]] = None,
     ) -> None:
         r"""
         Args:
@@ -543,7 +570,7 @@ class Michalewicz(SyntheticTestFunction):
         self._optimizers = optimizers.get(self.dim)
         super().__init__(noise_std=noise_std, negate=negate, bounds=bounds)
         self.register_buffer(
-            "i", torch.tensor(tuple(range(1, self.dim + 1)), dtype=torch.float)
+            "i", torch.tensor(tuple(range(1, self.dim + 1)), dtype=self.bounds.dtype)
         )
 
     @property
@@ -557,12 +584,26 @@ class Michalewicz(SyntheticTestFunction):
         m = 10
         return -(
             torch.sum(
-                torch.sin(X) * torch.sin(self.i * X**2 / math.pi) ** (2 * m), dim=-1
+                torch.sin(X) * torch.sin(self.i * X.pow(2) / math.pi).pow(2 * m), dim=-1
             )
         )
 
 
 class Powell(SyntheticTestFunction):
+    r"""Powell synthetic test function.
+
+    `d`-dim function (usually evaluated on the hypercube `[-4, 5]^d`):
+
+        P(x) = sum_{i=1}^d/4 (
+        (x_{4i-3} + 10 x_{4i-2})**2
+        + 5 (x_{4i-1} - x_{4i})**2
+        + (x_{4i-2} - 2 x_{4i-1})**4
+        + 10 (x_{4i-3} - x_{4i})**4
+        )
+
+
+    P has a global minimizer at `z = (0, ..., 0)` with `P(z) = 0`.
+    """
 
     _optimal_value = 0.0
 
@@ -571,7 +612,7 @@ class Powell(SyntheticTestFunction):
         dim=4,
         noise_std: Optional[float] = None,
         negate: bool = False,
-        bounds: Optional[List[Tuple[float, float]]] = None,
+        bounds: Optional[list[tuple[float, float]]] = None,
     ) -> None:
         r"""
         Args:
@@ -590,10 +631,10 @@ class Powell(SyntheticTestFunction):
         result = torch.zeros_like(X[..., 0])
         for i in range(self.dim // 4):
             i_ = i + 1
-            part1 = (X[..., 4 * i_ - 4] + 10.0 * X[..., 4 * i_ - 3]) ** 2
-            part2 = 5.0 * (X[..., 4 * i_ - 2] - X[..., 4 * i_ - 1]) ** 2
-            part3 = (X[..., 4 * i_ - 3] - 2.0 * X[..., 4 * i_ - 2]) ** 4
-            part4 = 10.0 * (X[..., 4 * i_ - 4] - X[..., 4 * i_ - 1]) ** 4
+            part1 = (X[..., 4 * i_ - 4] + 10.0 * X[..., 4 * i_ - 3]).pow(2)
+            part2 = 5.0 * (X[..., 4 * i_ - 2] - X[..., 4 * i_ - 1]).pow(2)
+            part3 = (X[..., 4 * i_ - 3] - 2.0 * X[..., 4 * i_ - 2]).pow(4)
+            part4 = 10.0 * (X[..., 4 * i_ - 4] - X[..., 4 * i_ - 1]).pow(4)
             result += part1 + part2 + part3 + part4
         return result
 
@@ -607,7 +648,7 @@ class Rastrigin(SyntheticTestFunction):
         dim=2,
         noise_std: Optional[float] = None,
         negate: bool = False,
-        bounds: Optional[List[Tuple[float, float]]] = None,
+        bounds: Optional[list[tuple[float, float]]] = None,
     ) -> None:
         r"""
         Args:
@@ -624,7 +665,7 @@ class Rastrigin(SyntheticTestFunction):
 
     def evaluate_true(self, X: Tensor) -> Tensor:
         return 10.0 * self.dim + torch.sum(
-            X**2 - 10.0 * torch.cos(2.0 * math.pi * X), dim=-1
+            X.pow(2) - 10.0 * torch.cos(2.0 * math.pi * X), dim=-1
         )
 
 
@@ -646,7 +687,7 @@ class Rosenbrock(SyntheticTestFunction):
         dim=2,
         noise_std: Optional[float] = None,
         negate: bool = False,
-        bounds: Optional[List[Tuple[float, float]]] = None,
+        bounds: Optional[list[tuple[float, float]]] = None,
     ) -> None:
         r"""
         Args:
@@ -663,7 +704,7 @@ class Rosenbrock(SyntheticTestFunction):
 
     def evaluate_true(self, X: Tensor) -> Tensor:
         return torch.sum(
-            100.0 * (X[..., 1:] - X[..., :-1] ** 2) ** 2 + (X[..., :-1] - 1) ** 2,
+            100.0 * (X[..., 1:] - X[..., :-1].pow(2)).pow(2) + (X[..., :-1] - 1).pow(2),
             dim=-1,
         )
 
@@ -688,7 +729,7 @@ class Shekel(SyntheticTestFunction):
         m: int = 10,
         noise_std: Optional[float] = None,
         negate: bool = False,
-        bounds: Optional[List[Tuple[float, float]]] = None,
+        bounds: Optional[list[tuple[float, float]]] = None,
     ) -> None:
         r"""
         Args:
@@ -702,9 +743,7 @@ class Shekel(SyntheticTestFunction):
         self._optimal_value = optvals[self.m]
         super().__init__(noise_std=noise_std, negate=negate, bounds=bounds)
 
-        self.register_buffer(
-            "beta", torch.tensor([1, 2, 2, 4, 4, 6, 3, 7, 5, 5], dtype=torch.float)
-        )
+        self.register_buffer("beta", torch.tensor([1, 2, 2, 4, 4, 6, 3, 7, 5, 5.0]))
         C_t = torch.tensor(
             [
                 [4, 1, 8, 6, 3, 2, 5, 8, 6, 7],
@@ -712,7 +751,6 @@ class Shekel(SyntheticTestFunction):
                 [4, 1, 8, 6, 3, 2, 5, 8, 6, 7],
                 [4, 1, 8, 6, 7, 9, 3, 1, 2, 3.6],
             ],
-            dtype=torch.float,
         )
         self.register_buffer("C", C_t.transpose(-1, -2))
 
@@ -720,7 +758,7 @@ class Shekel(SyntheticTestFunction):
         self.to(device=X.device, dtype=X.dtype)
         beta = self.beta / 10.0
         result = -sum(
-            1 / (torch.sum((X - self.C[i]) ** 2, dim=-1) + beta[i])
+            1 / (torch.sum((X - self.C[i]).pow(2), dim=-1) + beta[i])
             for i in range(self.m)
         )
         return result
@@ -736,9 +774,9 @@ class SixHumpCamel(SyntheticTestFunction):
     def evaluate_true(self, X: Tensor) -> Tensor:
         x1, x2 = X[..., 0], X[..., 1]
         return (
-            (4 - 2.1 * x1**2 + x1**4 / 3) * x1**2
+            (4 - 2.1 * x1.pow(2) + x1.pow(4) / 3) * x1.pow(2)
             + x1 * x2
-            + (4 * x2**2 - 4) * x2**2
+            + (4 * x2.pow(2) - 4) * x2.pow(2)
         )
 
 
@@ -757,7 +795,7 @@ class StyblinskiTang(SyntheticTestFunction):
         dim=2,
         noise_std: Optional[float] = None,
         negate: bool = False,
-        bounds: Optional[List[Tuple[float, float]]] = None,
+        bounds: Optional[list[tuple[float, float]]] = None,
     ) -> None:
         r"""
         Args:
@@ -774,7 +812,7 @@ class StyblinskiTang(SyntheticTestFunction):
         super().__init__(noise_std=noise_std, negate=negate, bounds=bounds)
 
     def evaluate_true(self, X: Tensor) -> Tensor:
-        return 0.5 * (X**4 - 16 * X**2 + 5 * X).sum(dim=-1)
+        return 0.5 * (X.pow(4) - 16 * X.pow(2) + 5 * X).sum(dim=-1)
 
 
 class ThreeHumpCamel(SyntheticTestFunction):
@@ -786,13 +824,178 @@ class ThreeHumpCamel(SyntheticTestFunction):
 
     def evaluate_true(self, X: Tensor) -> Tensor:
         x1, x2 = X[..., 0], X[..., 1]
-        return 2.0 * x1**2 - 1.05 * x1**4 + x1**6 / 6.0 + x1 * x2 + x2**2
+        return (
+            2.0 * x1.pow(2) - 1.05 * x1.pow(4) + x1.pow(6) / 6.0 + x1 * x2 + x2.pow(2)
+        )
 
 
 #  ------------ Constrained synthetic test functions ----------- #
 
 
-class PressureVessel(SyntheticTestFunction, ConstrainedBaseTestProblem):
+class ConstrainedSyntheticTestFunction(
+    ConstrainedBaseTestProblem, SyntheticTestFunction, ABC
+):
+    r"""Base class for constrained synthetic test functions."""
+
+    def __init__(
+        self,
+        noise_std: Union[None, float, list[float]] = None,
+        constraint_noise_std: Union[None, float, list[float]] = None,
+        negate: bool = False,
+        bounds: Optional[list[tuple[float, float]]] = None,
+    ) -> None:
+        r"""
+        Args:
+            noise_std: Standard deviation of the observation noise. If a list is
+                provided, specifies separate noise standard deviations for each
+                objective in a multiobjective problem.
+            constraint_noise_std: Standard deviation of the constraint noise.
+                If a list is provided, specifies separate noise standard
+                deviations for each constraint.
+            negate: If True, negate the function.
+            bounds: Custom bounds for the function specified as (lower, upper) pairs.
+        """
+        SyntheticTestFunction.__init__(
+            self, noise_std=noise_std, negate=negate, bounds=bounds
+        )
+        self.constraint_noise_std = self._validate_constraint_noise(
+            constraint_noise_std
+        )
+
+    def _validate_constraint_noise(
+        self, constraint_noise_std
+    ) -> Union[None, float, list[float]]:
+        """
+        Validates that constraint_noise_std has length equal to
+        the number of constraints, if given as a list
+
+        Args:
+            constraint_noise_std: Standard deviation of the constraint noise.
+                If a list is provided, specifies separate noise standard
+                deviations for each constraint.
+        """
+        if (
+            isinstance(constraint_noise_std, list)
+            and len(constraint_noise_std) != self.num_constraints
+        ):
+            raise InputDataError(
+                "If specified as a list, length of constraint_noise_std "
+                f"({len(constraint_noise_std)}) must match the "
+                f"number of constraints ({self.num_constraints})"
+            )
+        return constraint_noise_std
+
+
+class ConstrainedGramacy(ConstrainedSyntheticTestFunction):
+    r"""Constrained Gramacy test function.
+
+    This problem comes from [Gramacy2016]_. The problem is defined
+    over the unit cube and the goal is to minimize x1+x2 subject to
+    1.5 - x1 - 2 * x2 - 0.5 * sin(2*pi*(x1^2 - 2 * x2)) <= 0
+    and x1^2 + x2^2 - 1.5 <= 0.
+    """
+
+    num_objectives = 1
+    num_constraints = 2
+    dim = 2
+    _bounds = [(0.0, 1.0), (0.0, 1.0)]
+    _optimizers = [(0.1954, 0.4044)]
+    _optimal_value = 0.5998  # approximate from [Gramacy2016]_
+
+    def evaluate_true(self, X: Tensor) -> Tensor:
+        """
+        Evaluate the function (w/o observation noise) on a set of points.
+
+        Args:
+            X: A `batch_shape x d`-dim tensor of point(s) at which to evaluate the
+                function.
+        """
+        return X.sum(dim=-1)
+
+    def evaluate_slack_true(self, X: Tensor) -> Tensor:
+        x1, x2 = X.split(1, dim=-1)
+        c1 = 1.5 - x1 - 2 * x2 - 0.5 * torch.sin(2 * math.pi * (x1.pow(2) - 2 * x2))
+        c2 = x1.pow(2) + x2.pow(2) - 1.5
+        return torch.cat([-c1, -c2], dim=-1)
+
+
+class ConstrainedHartmann(Hartmann, ConstrainedSyntheticTestFunction):
+    r"""Constrained Hartmann test function.
+
+    This is a constrained version of the standard Hartmann test function that
+    uses `||x||_2 <= 1` as the constraint. This problem comes from [Letham2019]_.
+    """
+
+    num_constraints = 1
+
+    def __init__(
+        self,
+        dim: int = 6,
+        noise_std: Union[None, float] = None,
+        constraint_noise_std: Union[None, float, list[float]] = None,
+        negate: bool = False,
+        bounds: Optional[list[tuple[float, float]]] = None,
+    ) -> None:
+        r"""
+        Args:
+            dim: The (input) dimension.
+            noise_std: Standard deviation of the observation noise.
+            constraint_noise_std: Standard deviation of the constraint noise.
+                If a list is provided, specifies separate noise standard
+                deviations for each constraint.
+            negate: If True, negate the function.
+            bounds: Custom bounds for the function specified as (lower, upper) pairs.
+        """
+        Hartmann.__init__(
+            self, dim=dim, noise_std=noise_std, negate=negate, bounds=bounds
+        )
+        self.constraint_noise_std = self._validate_constraint_noise(
+            constraint_noise_std
+        )
+
+    def evaluate_slack_true(self, X: Tensor) -> Tensor:
+        return -X.norm(dim=-1, keepdim=True) + 1
+
+
+class ConstrainedHartmannSmooth(Hartmann, ConstrainedSyntheticTestFunction):
+    r"""Smooth constrained Hartmann test function.
+
+    This is a constrained version of the standard Hartmann test function that
+    uses `||x||_2^2 <= 1` as the constraint to obtain smoother constraint slack.
+    """
+
+    num_constraints = 1
+
+    def __init__(
+        self,
+        dim: int = 6,
+        noise_std: Union[None, float] = None,
+        constraint_noise_std: Union[None, float, list[float]] = None,
+        negate: bool = False,
+        bounds: Optional[list[tuple[float, float]]] = None,
+    ) -> None:
+        r"""
+        Args:
+            dim: The (input) dimension.
+            noise_std: Standard deviation of the observation noise.
+            constraint_noise_std: Standard deviation of the constraint noise.
+                If a list is provided, specifies separate noise standard
+                deviations for each constraint.
+            negate: If True, negate the function.
+            bounds: Custom bounds for the function specified as (lower, upper) pairs.
+        """
+        Hartmann.__init__(
+            self, dim=dim, noise_std=noise_std, negate=negate, bounds=bounds
+        )
+        self.constraint_noise_std = self._validate_constraint_noise(
+            constraint_noise_std
+        )
+
+    def evaluate_slack_true(self, X: Tensor) -> Tensor:
+        return -X.pow(2).sum(dim=-1, keepdim=True) + 1
+
+
+class PressureVessel(ConstrainedSyntheticTestFunction):
     r"""Pressure vessel design problem with constraints.
 
     The four-dimensional pressure vessel design problem with four black-box
@@ -809,9 +1012,9 @@ class PressureVessel(SyntheticTestFunction, ConstrainedBaseTestProblem):
         x2 = round_nearest(x2, increment=0.0625, bounds=self._bounds[1])
         return (
             0.6224 * x1 * x3 * x4
-            + 1.7781 * x2 * (x3**2)
-            + 3.1661 * (x1**2) * x4
-            + 19.84 * (x1**2) * x3
+            + 1.7781 * x2 * x3.pow(2)
+            + 3.1661 * x1.pow(2) * x4
+            + 19.84 * x1.pow(2) * x3
         )
 
     def evaluate_slack_true(self, X: Tensor) -> Tensor:
@@ -820,14 +1023,14 @@ class PressureVessel(SyntheticTestFunction, ConstrainedBaseTestProblem):
             [
                 -x1 + 0.0193 * x3,
                 -x2 + 0.00954 * x3,
-                -math.pi * (x3**2) * x4 - (4 / 3) * math.pi * (x3**3) + 1296000.0,
+                -math.pi * x3.pow(2) * x4 - (4 / 3) * math.pi * x3.pow(3) + 1296000.0,
                 x4 - 240.0,
             ],
             dim=-1,
         )
 
 
-class WeldedBeamSO(SyntheticTestFunction, ConstrainedBaseTestProblem):
+class WeldedBeamSO(ConstrainedSyntheticTestFunction):
     r"""Welded beam design problem with constraints (single-outcome).
 
     The four-dimensional welded beam design proble problem with six
@@ -843,7 +1046,7 @@ class WeldedBeamSO(SyntheticTestFunction, ConstrainedBaseTestProblem):
 
     def evaluate_true(self, X: Tensor) -> Tensor:
         x1, x2, x3, x4 = X.unbind(-1)
-        return 1.10471 * (x1**2) * x2 + 0.04811 * x3 * x4 * (14.0 + x2)
+        return 1.10471 * x1.pow(2) * x2 + 0.04811 * x3 * x4 * (14.0 + x2)
 
     def evaluate_slack_true(self, X: Tensor) -> Tensor:
         x1, x2, x3, x4 = X.unbind(-1)
@@ -856,34 +1059,34 @@ class WeldedBeamSO(SyntheticTestFunction, ConstrainedBaseTestProblem):
         d_max = 0.25
 
         M = P * (L + x2 / 2)
-        R = torch.sqrt(0.25 * (x2**2 + (x1 + x3) ** 2))
-        J = 2 * math.sqrt(2) * x1 * x2 * (x2**2 / 12 + 0.25 * (x1 + x3) ** 2)
+        R = torch.sqrt(0.25 * (x2.pow(2) + (x1 + x3).pow(2)))
+        J = 2 * math.sqrt(2) * x1 * x2 * (x2.pow(2) / 12 + 0.25 * (x1 + x3).pow(2))
         P_c = (
             4.013
             * E
             * x3
-            * (x4**3)
+            * x4.pow(3)
             * 6
             / (L**2)
             * (1 - 0.25 * x3 * math.sqrt(E / G) / L)
         )
         t1 = P / (math.sqrt(2) * x1 * x2)
         t2 = M * R / J
-        t = torch.sqrt(t1**2 + t1 * t2 * x2 / R + t2**2)
-        s = 6 * P * L / (x4 * x3**2)
-        d = 4 * P * L**3 / (E * x3**3 * x4)
+        t = torch.sqrt(t1.pow(2) + t1 * t2 * x2 / R + t2.pow(2))
+        s = 6 * P * L / (x4 * x3.pow(2))
+        d = 4 * P * L**3 / (E * x3.pow(3) * x4)
 
         g1 = t - t_max
         g2 = s - s_max
         g3 = x1 - x4
-        g4 = 0.10471 * x1**2 + 0.04811 * x3 * x4 * (14.0 + x2) - 5.0
+        g4 = 0.10471 * x1.pow(2) + 0.04811 * x3 * x4 * (14.0 + x2) - 5.0
         g5 = d - d_max
         g6 = P - P_c
 
         return -torch.stack([g1, g2, g3, g4, g5, g6], dim=-1)
 
 
-class TensionCompressionString(SyntheticTestFunction, ConstrainedBaseTestProblem):
+class TensionCompressionString(ConstrainedSyntheticTestFunction):
     r"""Tension compression string optimization problem with constraints.
 
     The three-dimensional tension compression string optimization problem with
@@ -896,17 +1099,17 @@ class TensionCompressionString(SyntheticTestFunction, ConstrainedBaseTestProblem
 
     def evaluate_true(self, X: Tensor) -> Tensor:
         x1, x2, x3 = X.unbind(-1)
-        return (x1**2) * x2 * (x3 + 2)
+        return x1.pow(2) * x2 * (x3 + 2)
 
     def evaluate_slack_true(self, X: Tensor) -> Tensor:
         x1, x2, x3 = X.unbind(-1)
         constraints = torch.stack(
             [
-                1 - (x2**3) * x3 / (71785 * (x1**4)),
-                (4 * (x2**2) - x1 * x2) / (12566 * (x1**3) * (x2 - x1))
-                + 1 / (5108 * (x1**2))
+                1 - x2.pow(3) * x3 / (71785 * x1.pow(4)),
+                (4 * x2.pow(2) - x1 * x2) / (12566 * x1.pow(3) * (x2 - x1))
+                + 1 / (5108 * x1.pow(2))
                 - 1,
-                1 - 140.45 * x1 / (x3 * (x2**2)),
+                1 - 140.45 * x1 / (x3 * x2.pow(2)),
                 (x1 + x2) / 1.5 - 1,
             ],
             dim=-1,
@@ -914,7 +1117,7 @@ class TensionCompressionString(SyntheticTestFunction, ConstrainedBaseTestProblem
         return -constraints.clamp_max(100)
 
 
-class SpeedReducer(SyntheticTestFunction, ConstrainedBaseTestProblem):
+class SpeedReducer(ConstrainedSyntheticTestFunction):
     r"""Speed Reducer design problem with constraints.
 
     The seven-dimensional speed reducer design problem with eleven black-box
@@ -936,27 +1139,27 @@ class SpeedReducer(SyntheticTestFunction, ConstrainedBaseTestProblem):
     def evaluate_true(self, X: Tensor) -> Tensor:
         x1, x2, x3, x4, x5, x6, x7 = X.unbind(-1)
         return (
-            0.7854 * x1 * (x2**2) * (3.3333 * (x3**2) + 14.9334 * x3 - 43.0934)
-            + -1.508 * x1 * (x6**2 + x7**2)
-            + 7.4777 * (x6**3 + x7**3)
-            + 0.7854 * (x4 * (x6**2) + x5 * (x7**2))
+            0.7854 * x1 * x2.pow(2) * (3.3333 * x3.pow(2) + 14.9334 * x3 - 43.0934)
+            + -1.508 * x1 * (x6.pow(2) + x7.pow(2))
+            + 7.4777 * (x6.pow(3) + x7.pow(3))
+            + 0.7854 * (x4 * x6.pow(2) + x5 * x7.pow(2))
         )
 
     def evaluate_slack_true(self, X: Tensor) -> Tensor:
         x1, x2, x3, x4, x5, x6, x7 = X.unbind(-1)
         return -torch.stack(
             [
-                27.0 * (1 / x1) * (1 / (x2**2)) * (1 / x3) - 1,
-                397.5 * (1 / x1) * (1 / (x2**2)) * (1 / (x3**2)) - 1,
-                1.93 * (1 / x2) * (1 / x3) * (x4**3) * (1 / (x6**4)) - 1,
-                1.93 * (1 / x2) * (1 / x3) * (x5**3) * (1 / (x7**4)) - 1,
+                27.0 * (1 / x1) * (1 / x2.pow(2)) * (1 / x3) - 1,
+                397.5 * (1 / x1) * (1 / x2.pow(2)) * (1 / x3.pow(2)) - 1,
+                1.93 * (1 / x2) * (1 / x3) * x4.pow(3) * (1 / x6.pow(4)) - 1,
+                1.93 * (1 / x2) * (1 / x3) * x5.pow(3) * (1 / x7.pow(4)) - 1,
                 1
-                / (0.1 * (x6**3))
-                * torch.sqrt((745 * x4 / (x2 * x3)) ** 2 + 16.9 * 1e6)
+                / (0.1 * x6.pow(3))
+                * torch.sqrt((745 * x4 / (x2 * x3)).pow(2) + 16.9 * 1e6)
                 - 1100,
                 1
-                / (0.1 * (x7**3))
-                * torch.sqrt((745 * x5 / (x2 * x3)) ** 2 + 157.5 * 1e6)
+                / (0.1 * x7.pow(3))
+                * torch.sqrt((745 * x5 / (x2 * x3)).pow(2) + 157.5 * 1e6)
                 - 850,
                 x2 * x3 - 40,
                 5 - x1 / x2,

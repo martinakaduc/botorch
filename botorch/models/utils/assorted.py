@@ -9,8 +9,9 @@ r"""Assorted helper methods and objects for working with BoTorch models."""
 from __future__ import annotations
 
 import warnings
+from collections.abc import Iterator
 from contextlib import contextmanager, ExitStack
-from typing import Iterator, List, Optional, Tuple
+from typing import Optional
 
 import torch
 from botorch import settings
@@ -21,7 +22,7 @@ from gpytorch.module import Module
 from torch import Tensor
 
 
-def _make_X_full(X: Tensor, output_indices: List[int], tf: int) -> Tensor:
+def _make_X_full(X: Tensor, output_indices: list[int], tf: int) -> Tensor:
     r"""Helper to construct input tensor with task indices.
 
     Args:
@@ -49,7 +50,7 @@ def multioutput_to_batch_mode_transform(
     train_Y: Tensor,
     num_outputs: int,
     train_Yvar: Optional[Tensor] = None,
-) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
+) -> tuple[Tensor, Tensor, Optional[Tensor]]:
     r"""Transforms training inputs for a multi-output model.
 
     Used for multi-output models that internally are represented by a
@@ -84,7 +85,7 @@ def multioutput_to_batch_mode_transform(
     return train_X, train_Y, train_Yvar
 
 
-def add_output_dim(X: Tensor, original_batch_shape: torch.Size) -> Tuple[Tensor, int]:
+def add_output_dim(X: Tensor, original_batch_shape: torch.Size) -> tuple[Tensor, int]:
     r"""Insert the output dimension at the correct location.
 
     The trailing batch dimensions of X must match the original batch dimensions
@@ -111,7 +112,8 @@ def add_output_dim(X: Tensor, original_batch_shape: torch.Size) -> Tuple[Tensor,
         except RuntimeError:
             raise RuntimeError(
                 "The trailing batch dimensions of X must match the trailing "
-                "batch dimensions of the training inputs."
+                f"batch dimensions of the training inputs. Got {X.shape=} "
+                f"and {original_batch_shape=}."
             )
     # insert `m` dimension
     X = X.unsqueeze(-3)
@@ -136,7 +138,7 @@ def check_min_max_scaling(
     strict: bool = False,
     atol: float = 1e-2,
     raise_on_fail: bool = False,
-    ignore_dims: Optional[List[int]] = None,
+    ignore_dims: Optional[list[int]] = None,
 ) -> None:
     r"""Check that tensor is normalized to the unit cube.
 
@@ -170,7 +172,7 @@ def check_min_max_scaling(
             )
             if raise_on_fail:
                 raise InputDataError(msg)
-            warnings.warn(msg, InputDataWarning)
+            warnings.warn(msg, InputDataWarning, stacklevel=2)
 
 
 def check_standardization(
@@ -190,15 +192,28 @@ def check_standardization(
         raise_on_fail: If True, raise an exception instead of a warning.
     """
     with torch.no_grad():
-        Ymean, Ystd = torch.mean(Y, dim=-2), torch.std(Y, dim=-2)
-        if torch.abs(Ymean).max() > atol_mean or torch.abs(Ystd - 1).max() > atol_std:
-            msg = (
-                f"Input data is not standardized (mean = {Ymean}, std = {Ystd}). "
-                "Please consider scaling the input to zero mean and unit variance."
-            )
-            if raise_on_fail:
-                raise InputDataError(msg)
-            warnings.warn(msg, InputDataWarning)
+        Ymean = torch.mean(Y, dim=-2)
+        mean_not_zero = torch.abs(Ymean).max() > atol_mean
+        if Y.shape[-2] <= 1:
+            if mean_not_zero:
+                msg = (
+                    f"Data is not standardized (mean = {Ymean}). "
+                    "Please consider scaling the input to zero mean and unit variance."
+                )
+                if raise_on_fail:
+                    raise InputDataError(msg)
+                warnings.warn(msg, InputDataWarning, stacklevel=2)
+        else:
+            Ystd = torch.std(Y, dim=-2)
+            std_not_one = torch.abs(Ystd - 1).max() > atol_std
+            if mean_not_zero or std_not_one:
+                msg = (
+                    f"Data is not standardized (std = {Ystd}, mean = {Ymean}). "
+                    "Please consider scaling the input to zero mean and unit variance."
+                )
+                if raise_on_fail:
+                    raise InputDataError(msg)
+                warnings.warn(msg, InputDataWarning, stacklevel=2)
 
 
 def validate_input_scaling(
@@ -206,7 +221,7 @@ def validate_input_scaling(
     train_Y: Tensor,
     train_Yvar: Optional[Tensor] = None,
     raise_on_fail: bool = False,
-    ignore_X_dims: Optional[List[int]] = None,
+    ignore_X_dims: Optional[list[int]] = None,
 ) -> None:
     r"""Helper function to validate input data to models.
 
@@ -246,7 +261,7 @@ def validate_input_scaling(
     check_standardization(Y=train_Y, raise_on_fail=raise_on_fail)
 
 
-def mod_batch_shape(module: Module, names: List[str], b: int) -> None:
+def mod_batch_shape(module: Module, names: list[str], b: int) -> None:
     r"""Recursive helper to modify gpytorch modules' batch shape attribute.
 
     Modifies the module in-place.
@@ -286,7 +301,7 @@ def detect_duplicates(
     X: Tensor,
     rtol: float = 0,
     atol: float = 1e-8,
-) -> Iterator[Tuple[int, int]]:
+) -> Iterator[tuple[int, int]]:
     """Returns an iterator over index pairs `(duplicate index, original index)` for all
     duplicate entries of `X`. Supporting 2-d Tensor only.
 
@@ -317,8 +332,8 @@ def detect_duplicates(
 
 
 def consolidate_duplicates(
-    X: Tensor, Y: Tensor, rtol: float = 0, atol: float = 1e-8
-) -> Tuple[Tensor, Tensor, Tensor]:
+    X: Tensor, Y: Tensor, rtol: float = 0.0, atol: float = 1e-8
+) -> tuple[Tensor, Tensor, Tensor]:
     """Drop duplicated Xs and update the indices tensor Y accordingly.
     Supporting 2d Tensor only as in batch mode block design is not guaranteed.
 
@@ -374,4 +389,5 @@ def consolidate_duplicates(
 
 class fantasize(_Flag):
     r"""A flag denoting whether we are currently in a `fantasize` context."""
+
     _state: bool = False

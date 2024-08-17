@@ -28,9 +28,9 @@ class AcquisitionFunction(Module, ABC):
     Please note that if your acquisition requires a backwards call,
     you will need to wrap the backwards call inside of an enable_grad
     context to be able to optimize the acquisition. See #1164.
-
-    :meta private:
     """
+
+    _log: bool = False  # whether the acquisition utilities are in log-space
 
     def __init__(self, model: Model) -> None:
         r"""Constructor for the AcquisitionFunction base class.
@@ -77,13 +77,11 @@ class AcquisitionFunction(Module, ABC):
 class OneShotAcquisitionFunction(AcquisitionFunction, ABC):
     r"""
     Abstract base class for acquisition functions using one-shot optimization
-
-    :meta private:
     """
 
     @abstractmethod
     def get_augmented_q_batch_size(self, q: int) -> int:
-        r"""Get augmented q batch size for one-shot optimziation.
+        r"""Get augmented q batch size for one-shot optimization.
 
         Args:
             q: The number of candidates to consider jointly.
@@ -113,8 +111,6 @@ class MCSamplerMixin(ABC):
 
     Attributes:
         _default_sample_shape: The `sample_shape` for the default sampler.
-
-    :meta private:
     """
 
     _default_sample_shape = torch.Size([512])
@@ -124,7 +120,8 @@ class MCSamplerMixin(ABC):
 
         Args:
             sampler: The sampler used to draw base samples for MC-based acquisition
-                functions. If `None`, a sampler is generated using `get_sampler`.
+                functions. If `None`, a sampler is generated on the fly within
+                the `get_posterior_samples` method using `get_sampler`.
         """
         self.sampler = sampler
 
@@ -166,8 +163,6 @@ class MultiModelAcquisitionFunction(AcquisitionFunction, ABC):
     This is currently only a placeholder to help with some development
     in Ax. We plan to add some acquisition functions utilizing multiple
     models in the future.
-
-    :meta private:
     """
 
     def __init__(self, model_dict: ModelDict) -> None:

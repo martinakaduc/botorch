@@ -8,6 +8,10 @@ from botorch.acquisition.multi_objective.analytic import (
     ExpectedHypervolumeImprovement,
     MultiObjectiveAnalyticAcquisitionFunction,
 )
+from botorch.acquisition.multi_objective.hypervolume_knowledge_gradient import (
+    qHypervolumeKnowledgeGradient,
+    qMultiFidelityHypervolumeKnowledgeGradient,
+)
 from botorch.acquisition.multi_objective.max_value_entropy_search import (
     qMultiObjectiveMaxValueEntropy,
 )
@@ -18,11 +22,8 @@ from botorch.acquisition.multi_objective.monte_carlo import (
 )
 from botorch.acquisition.multi_objective.multi_fidelity import MOMF
 from botorch.acquisition.multi_objective.objective import (
-    AnalyticMultiOutputObjective,
-    IdentityAnalyticMultiOutputObjective,
     IdentityMCMultiOutputObjective,
     MCMultiOutputObjective,
-    UnstandardizeMCMultiOutputObjective,
     WeightedMCMultiOutputObjective,
 )
 from botorch.acquisition.multi_objective.utils import (
@@ -35,16 +36,15 @@ __all__ = [
     "get_default_partitioning_alpha",
     "prune_inferior_points_multi_objective",
     "qExpectedHypervolumeImprovement",
+    "qHypervolumeKnowledgeGradient",
+    "qMultiFidelityHypervolumeKnowledgeGradient",
     "qNoisyExpectedHypervolumeImprovement",
     "MOMF",
     "qMultiObjectiveMaxValueEntropy",
-    "AnalyticMultiOutputObjective",
     "ExpectedHypervolumeImprovement",
-    "IdentityAnalyticMultiOutputObjective",
     "IdentityMCMultiOutputObjective",
     "MCMultiOutputObjective",
     "MultiObjectiveAnalyticAcquisitionFunction",
     "MultiObjectiveMCAcquisitionFunction",
-    "UnstandardizeMCMultiOutputObjective",
     "WeightedMCMultiOutputObjective",
 ]
